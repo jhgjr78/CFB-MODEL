@@ -1,14 +1,36 @@
-name: CFB Model
+name: CFB Model (Baseline)
 
 on:
-  workflow_dispatch:  # lets you trigger manually
+  workflow_dispatch:        # run manually from Actions tab
 
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Test workflow
-        run: echo "✅ Workflow connected!"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Generate sample predictions (stub)
+        run: |
+          python - << 'PY'
+          import pandas as pd
+          rows = [
+            {"home":"Team A","away":"Team B","adj_spread":+4.5,"total_pts":52,"home_pts":28,"away_pts":24,"favored":"Team A"},
+            {"home":"Team C","away":"Team D","adj_spread":-3.0,"total_pts":48,"home_pts":22,"away_pts":26,"favored":"Team D"},
+          ]
+          pd.DataFrame(rows).to_csv("week_preds.csv", index=False)
+          PY
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: week_preds
+          path: week_preds.csv
