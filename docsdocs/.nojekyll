@@ -1,0 +1,14 @@
+
+<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CFB Model — Mobile</title>
+<style>
+:root{--red:#cc0000;--blue:#003366}
+body{font-family:system-ui,Arial;margin:16px;color:var(--blue)}
+h1{color:#fff;background:var(--red);padding:10px;border-radius:10px;font-size:20px}
+a.btn{display:inline-block;background:var(--blue);color:#fff;padding:10px 14px;border-radius:10px;text-decoration:none}
+.note{font-size:14px;opacity:.8;margin-top:10px}
+</style>
+<h1>CFB Model — Mobile Dashboard</h1>
+<p>✅ Pages is live. The workflow will publish weekly predictions here.</p>
+<p><a class="btn" href="https://github.com/jhgjr78/CFB-MODEL/actions">Open Actions</a></p>
+<p class="note">Theme: Discovery red & blue.</p>
