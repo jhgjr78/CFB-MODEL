@@ -243,40 +243,80 @@ jobs:
 
               log("7/7: computing spreads & dynamic totals…")
               out=[]
-              for _,g in gdf.iterrows():
-                h, a = g["homeTeam"], g["awayTeam"]
+             
+for _, g in gdf.iterrows():
+    h, a = g["homeTeam"], g["awayTeam"]
 
-                base = ((off_map.get(h,0.0)-def_map.get(a,0.0)) -
-                        (off_map.get(a,0.0)-def_map.get(h,0.0))) / 0.10 * SCALE_PER_0P10 + HFA
+    # --- Base spread from PPA + HFA ---
+    HFA = HFA_DEFAULT if not bool(g.get("neutralSite")) else 0.5  # tiny HFA on neutral
+    base = ((off_map.get(h,0.0) - def_map.get(a,0.0)) -
+            (off_map.get(a,0.0) - def_map.get(h,0.0))) / 0.10 * SCALE_PER_0P10 + HFA
 
-                plays = pace_total(h,a)
-                xpl  = pace_scale(explosiveness_points(h,a), plays)
-                sr   = pace_scale(success_points(h,a), plays)
-                hv   = pace_scale(havoc_points(h,a), plays)
-                rcy  = await recency_points(h,a)
-                fp   = fp_points(h,a) if MODE=="FULL" else 0.0
-                hy   = hidden_yards(h,a) if MODE=="FULL" else 0.0
+    # --- Pace & components ---
+    plays = pace_total(h, a)
 
-                adj  = base + fp + hy + xpl + sr + hv + rcy
+    xpl_raw = pace_scale(explosiveness_points(h,a), plays)
+    sr_raw  = pace_scale(success_points(h,a),        plays)
+    hv_raw  = pace_scale(havoc_points(h,a),         plays)
 
-                # Dynamic total from epp * plays (split plays roughly 50/50)
-                epp_h = team_epp(off_map.get(h,0.0), def_map.get(a,0.0))
-                epp_a = team_epp(off_map.get(a,0.0), def_map.get(h,0.0))
-                plays_h = plays_a = plays/2.0
-                total_pts = round(epp_h*plays_h + epp_a*plays_a)
+    fp_raw  = fp_points(h,a) if MODE=="FULL" else 0.0
+    hy_raw  = hidden_yards(h,a) if MODE=="FULL" else 0.0
 
-                home_pts = round((total_pts + adj)/2)
-                away_pts = round(total_pts - home_pts)
+    # recency is async in our earlier code; if yours is async keep `await`
+    rcy_raw = await recency_points(h,a)
 
-                fav  = h if adj >= 0 else a
+    # Clamp each component contribution
+    def cap(name, val):
+        return clamp(val * WEIGHTS[name], -COMP_LIMITS[name], COMP_LIMITS[name])
 
-                k=(h,a)
-                v_spread = v_total = None
-                if k in vegas:
-                  v_spread = vegas[k]["vegas_spread"]
-                  v_total  = vegas[k]["vegas_total"]
+    fp  = cap("fp", fp_raw)
+    hy  = cap("hidden", hy_raw)
+    xpl = cap("xpl", xpl_raw)
+    sr  = cap("sr",  sr_raw)
+    hv  = cap("havoc", hv_raw)
+    rcy = cap("recency", rcy_raw)
 
-                out.append({
+    # Final spread (also clamp overall spread to a sane envelope)
+    adj  = base + fp + hy + xpl + sr + hv + rcy
+    adj  = clamp(adj, -40.0, 40.0)   # CFB spreads shouldn’t exceed ~40
+
+    # --- Dynamic total (NO hardcoded 55) ---
+    total_pts = predict_total_pts(
+        plays=plays,
+        off_ppa_home=off_map.get(h,0.0),
+        def_ppa_away=def_map.get(a,0.0),
+        off_ppa_away=off_map.get(a,0.0),
+        def_ppa_home=def_map.get(h,0.0),
+        xpl_pts=xpl, sr_pts=sr
+    )
+
+    # Convert (spread,total) → scores and zero-clip
+    home_pts = int(round((total_pts + adj)/2))
+    away_pts = int(round(total_pts - home_pts))
+    home_pts = max(0, home_pts)
+    away_pts = max(0, away_pts)
+
+    fav  = h if adj >= 0 else a
+
+    # Vegas (if you built the map earlier)
+    k=(h,a)
+    v_spread = vegas.get(k,{}).get("vegas_spread") if 'vegas' in locals() else None
+    v_total  = vegas.get(k,{}).get("vegas_total")  if 'vegas' in locals() else None
+
+    out.append({
+      "home":h,"away":a,"favored":fav,
+      "base_spread": round(base,1),
+      "adj_spread":  round(adj,1),
+      "home_pts": int(home_pts), "away_pts": int(away_pts),
+      "total_pts": int(total_pts),
+      "plays_est": int(round(plays)),
+      "fp": round(fp,2), "hidden": round(hy,2),
+      "xpl": round(xpl,2), "sr": round(sr,2),
+      "havoc": round(hv,2), "recency": round(rcy,2),
+      "vegas_spread": v_spread, "vegas_total": v_total
+    })
+                
+out.append({
                   "home":h,"away":a,"favored":fav,
                   "base_spread": round(base,1),
                   "adj_spread":  round(adj,1),
