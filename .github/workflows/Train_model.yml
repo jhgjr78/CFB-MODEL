@@ -1,0 +1,94 @@
+name: CFB Model — Train ML
+
+on:
+  workflow_dispatch:
+    inputs:
+      holdout_year:
+        description: "Hold out this season for validation (e.g., 2024)"
+        required: true
+        default: "2024"
+
+permissions:
+  contents: write
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Install deps
+        run: |
+          pip install pandas scikit-learn joblib
+
+      - name: Train spread & total models
+        env:
+          HOLDOUT: ${{ github.event.inputs.holdout_year }}
+        run: |
+          python - << 'PY'
+          import os, json, pandas as pd, numpy as np
+          from sklearn.linear_model import RidgeCV
+          from sklearn.metrics import mean_absolute_error
+          from joblib import dump
+
+          holdout = int(os.getenv("HOLDOUT","2024"))
+          df = pd.read_csv("data/all_games_combined.csv")
+
+          # split
+          train = df[df["year"] != holdout].copy()
+          val   = df[df["year"] == holdout].copy()
+
+          # features (keep simple & robust)
+          FEATURES = ["ppa_gap_home","hfa","h_off_ppa","h_def_ppa","a_off_ppa","a_def_ppa","plays_est"]
+          def Xy(d, target):
+            X = d[FEATURES].fillna(0.0).values
+            y = d[target].values
+            return X, y
+
+          # SPREAD model (predict home margin)
+          Xs, ys = Xy(train, "spread_actual")
+          Xv, yv = Xy(val,   "spread_actual")
+          spread_m = RidgeCV(alphas=[0.1,1,3,10], cv=5).fit(Xs, ys)
+          pred_sp_v = spread_m.predict(Xv)
+          mae_sp = float(mean_absolute_error(yv, pred_sp_v))
+          acc_sp = float(np.mean(np.sign(pred_sp_v) == np.sign(yv)))
+
+          # TOTAL model
+          Xt, yt = Xy(train, "total_actual")
+          Xvt,yvt= Xy(val,   "total_actual")
+          total_m = RidgeCV(alphas=[0.1,1,3,10], cv=5).fit(Xt, yt)
+          pred_to_v = total_m.predict(Xvt)
+          mae_to = float(mean_absolute_error(yvt, pred_to_v))
+
+          # save models + coefficients for transparency
+          os.makedirs("models", exist_ok=True)
+          dump(spread_m, "models/spread_ridge.joblib")
+          dump(total_m,  "models/total_ridge.joblib")
+
+          rep = {
+            "holdout": holdout,
+            "n_train": int(len(train)),
+            "n_val":   int(len(val)),
+            "features": FEATURES,
+            "spread": {"mae": round(mae_sp,2), "direction_acc": round(acc_sp,3), "alpha": float(spread_m.alpha_)},
+            "total":  {"mae": round(mae_to,2), "alpha": float(total_m.alpha_)},
+            "coefficients": {
+              "spread": dict(zip(FEATURES, map(float, spread_m.coef_))),
+              "total":  dict(zip(FEATURES, map(float, total_m.coef_))),
+            }
+          }
+          print("::notice::", rep)
+          os.makedirs("docs", exist_ok=True)
+          with open("docs/ml_metrics.json","w") as f: json.dump(rep, f, indent=2)
+          PY
+
+      - name: Commit models & metrics
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add models/ docs/ml_metrics.json
+          git commit -m "Train ML and publish metrics" || echo "No changes"
+          git push
