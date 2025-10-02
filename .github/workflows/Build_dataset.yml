@@ -1,0 +1,119 @@
+name: CFB Data — Build Season Dataset
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year: { description: "First season (e.g., 2019)", required: true, default: "2019" }
+      end_year:   { description: "Last season (e.g., 2024)",  required: true, default: "2024" }
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Install deps
+        run: |
+          pip install pandas httpx
+
+      - name: Build datasets
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          START: ${{ github.event.inputs.start_year }}
+          END:   ${{ github.event.inputs.end_year }}
+        run: |
+          python - << 'PY'
+          import os, asyncio, pandas as pd, httpx, json
+          KEY=os.getenv("CFBD_API_KEY"); HEAD={"Authorization": f"Bearer {KEY}"} if KEY else {}
+          START=int(os.getenv("START","2019")); END=int(os.getenv("END","2024"))
+          BASE="https://api.collegefootballdata.com"
+
+          async def jget(cli,u,params=None):
+            r=await cli.get(u,headers=HEAD,params=params or {},timeout=40); r.raise_for_status(); return r.json()
+
+          async def build_year(y):
+            async with httpx.AsyncClient(base_url=BASE) as cli:
+              games = await jget(cli,"/games",{"year":y,"seasonType":"regular"})
+              gdf = pd.DataFrame(games)
+              if gdf.empty: return None
+              # final scores only
+              gdf = gdf[["year","week","homeTeam","awayTeam","homePoints","awayPoints","neutralSite"]].rename(
+                     columns={"homeTeam":"home","awayTeam":"away","homePoints":"home_pts","awayPoints":"away_pts","neutralSite":"neutral"})
+              # vegas (avg across books)
+              lines = await jget(cli,"/lines",{"year":y,"seasonType":"regular"})
+              vmap={}
+              for ln in lines or []:
+                h,a = ln.get("homeTeam"), ln.get("awayTeam")
+                for b in (ln.get("lines") or []):
+                  sp=b.get("spread"); to=b.get("overUnder")
+                  vmap.setdefault((h,a),[]).append((sp,to))
+              vegas=[]
+              for (h,a),vals in vmap.items():
+                s=[v for v,_ in vals if isinstance(v,(int,float))]
+                t=[u for _,u in vals if isinstance(u,(int,float))]
+                vegas.append({"home":h,"away":a,
+                              "vegas_spread": round(sum(s)/len(s),1) if s else None,
+                              "vegas_total":  round(sum(t)/len(t),1) if t else None})
+              vdf=pd.DataFrame(vegas)
+
+              # team season PPA
+              ppa  = await jget(cli,"/ppa/teams",{"year":y})
+              rows=[]
+              for r in ppa:
+                t=r.get("team")
+                off=((r.get("offense") or {}).get("overall") or (r.get("offense") or {}).get("ppa") or 0.0) or 0.0
+                deff=((r.get("defense") or {}).get("overall") or (r.get("defense") or {}).get("ppa") or 0.0) or 0.0
+                rows.append({"team":t,"off_ppa":float(off),"def_ppa":float(deff)})
+              tdf=pd.DataFrame(rows)
+
+              # join features
+              df=gdf.merge(vdf, on=["home","away"], how="left")\
+                    .merge(tdf.add_prefix("h_"), left_on="home", right_on="h_team", how="left")\
+                    .merge(tdf.add_prefix("a_"), left_on="away", right_on="a_team", how="left")
+              df["spread_actual"] = df["home_pts"] - df["away_pts"]
+              df["total_actual"]  = df["home_pts"] + df["away_pts"]
+              # basic feature set (fast & stable)
+              df["ppa_gap_home"] = (df["h_off_ppa"] - df["a_def_ppa"]) - (df["a_off_ppa"] - df["h_def_ppa"])
+              # rough pace proxy from season offense plays if present (fallback 130)
+              df["plays_est"] = 130.0  # can enrich later
+              # neutral -> lower HFA
+              df["hfa"] = 0.0
+              df.loc[df["neutral"]==False, "hfa"] = 2.0
+
+              cols = ["year","week","home","away","home_pts","away_pts",
+                      "vegas_spread","vegas_total","ppa_gap_home","hfa",
+                      "spread_actual","total_actual","plays_est",
+                      "h_off_ppa","h_def_ppa","a_off_ppa","a_def_ppa"]
+              df=df[cols].dropna(subset=["spread_actual","total_actual"])
+              os.makedirs("data",exist_ok=True)
+              df.to_csv(f"data/all_games_{y}.csv", index=False)
+              return df
+
+          async def main():
+            frames=[]
+            for y in range(START, END+1):
+              try:
+                print(f"::notice::building year {y}")
+                df = await build_year(y)
+                if df is not None: frames.append(df)
+              except Exception as e:
+                print(f"::warning::year {y} failed: {e}")
+            if frames:
+              allpd=pd.concat(frames,ignore_index=True)
+              allpd.to_csv("data/all_games_combined.csv", index=False)
+          import asyncio; asyncio.run(main())
+          PY
+
+      - name: Commit dataset
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Update season datasets" || echo "No changes"
+          git push
