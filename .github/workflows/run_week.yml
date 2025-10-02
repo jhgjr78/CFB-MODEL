@@ -1,33 +1,43 @@
-name: CFB Model (Baseline)
+
+name: CFB Model — Baseline (mobile)
 
 on:
-  workflow_dispatch:        # run manually from Actions tab
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          pip install pandas
 
       - name: Generate sample predictions (stub)
         run: |
           python - << 'PY'
           import pandas as pd
-          rows = [
-            {"home":"Team A","away":"Team B","adj_spread":+4.5,"total_pts":52,"home_pts":28,"away_pts":24,"favored":"Team A"},
-            {"home":"Team C","away":"Team D","adj_spread":-3.0,"total_pts":48,"home_pts":22,"away_pts":26,"favored":"Team D"},
-          ]
-          pd.DataFrame(rows).to_csv("week_preds.csv", index=False)
+          df = pd.DataFrame([
+            {"home":"Oklahoma","away":"Auburn","favored":"Oklahoma","adj_spread":8.5,"total_pts":47,"home_pts":28,"away_pts":19},
+            {"home":"Utah","away":"Texas Tech","favored":"Utah","adj_spread":4.5,"total_pts":57,"home_pts":31,"away_pts":26},
+            {"home":"Notre Dame","away":"Purdue","favored":"Notre Dame","adj_spread":25.0,"total_pts":52,"home_pts":39,"away_pts":13},
+          ])
+          df.to_csv("week_preds.csv", index=False)
+          df.to_json("docs/week_preds.json", orient="records")
           PY
+
+      - name: Commit JSON to docs (for Pages)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/week_preds.json
+          git commit -m "Publish week_preds.json" || echo "No changes"
+          git push
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
