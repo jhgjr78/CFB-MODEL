@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CFB Model — Mobile</title>
+<style>
+:root{--red:#cc0000;--blue:#003366}
+body{font-family:system-ui,Arial;margin:16px;color:var(--blue)}
+h1{color:#fff;background:var(--red);padding:10px;border-radius:12px;font-size:20px}
+.card{background:#fff;border:1px solid #eee;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.05);padding:12px;margin:12px 0}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #eee;padding:8px;text-align:left;font-size:14px}
+th{background:var(--red);color:#fff;position:sticky;top:0}
+.badge{display:inline-block;background:var(--blue);color:#fff;padding:3px 8px;border-radius:999px;font-size:12px}
+.small{opacity:.8;font-size:12px}
+</style>
+
+<h1>CFB Model — Mobile Dashboard</h1>
+
+<div id="status" class="card">Loading latest results…</div>
+<div id="table" class="card" style="display:none"></div>
+
+<script>
+async function load() {
+  const s = document.getElementById('status');
+  try {
+    // the JSON is written by the GitHub Action to docs/week_preds.json
+    const res = await fetch('./week_preds.json?ts=' + Date.now());
+    if (!res.ok) throw new Error('No JSON yet');
+    const rows = await res.json();
+    if (!rows.length) throw new Error('Empty JSON');
+
+    // build table
+    const el = document.getElementById('table');
+    const cols = ["home","away","favored","adj_spread","total_pts","home_pts","away_pts"];
+    el.innerHTML = `
+      <div class="small">Theme: Discovery red & blue</div>
+      <table><thead><tr>
+        ${cols.map(c=>`<th>${c.replace('_',' ')}</th>`).join('')}
+      </tr></thead><tbody>
+        ${rows.map(r=>`<tr>${cols.map(c=>`<td>${r[c] ?? ''}</td>`).join('')}</tr>`).join('')}
+      </tbody></table>
+    `;
+    s.innerHTML = `<span class="badge">Live</span> Results updated`;
+    document.getElementById('table').style.display='block';
+  } catch(e) {
+    s.innerHTML = `No run published yet. Open <a href="../actions">Actions</a> and tap “Run workflow.”`;
+  }
+}
+load();
+</script>
+</html>
