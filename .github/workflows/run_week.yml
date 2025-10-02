@@ -297,6 +297,58 @@ jobs:
 
           asyncio.run(main())
           PY
+# ---------- NEW: safety helpers, scaling, and dynamic totals ----------
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+# Cap each component so nothing can blow up the spread.
+COMP_LIMITS = {
+    "fp": 6.0,          # field position max swing ±6 pts
+    "hidden": 4.0,      # hidden yards ±4
+    "xpl": 10.0,        # explosiveness ±10
+    "sr": 6.0,          # success rate ±6
+    "havoc": 6.0,       # havoc ±6
+    "recency": 6.0      # recent form ±6
+}
+
+# Conservative weights if your component functions already return "points".
+# (If they’re already in points—as in our earlier code—weights = 1.0 is OK;
+# we still clamp to COMP_LIMITS above.)
+WEIGHTS = {
+    "fp": 1.0,
+    "hidden": 1.0,
+    "xpl": 1.0,
+    "sr": 1.0,
+    "havoc": 1.0,
+    "recency": 1.0
+}
+
+# Base spread scaling from PPA gap stays the same (already in pts).
+SCALE_PER_0P10 = 3.0
+HFA_DEFAULT = 2.0
+
+# Dynamic total from pace + efficiency (no hard 55)
+BASE_EPP = 0.42  # ~55 pts over 130 plays
+def team_epp(off_ppa, opp_def_ppa):
+    epp = BASE_EPP + (off_ppa - opp_def_ppa)         # nudge by PPA gap
+    return clamp(epp, 0.10, 0.80)                     # keep sane
+
+def predict_total_pts(plays, off_ppa_home, def_ppa_away, off_ppa_away, def_ppa_home,
+                      xpl_pts=0.0, sr_pts=0.0):
+    # base from points/play * plays (split plays ~50/50)
+    epp_h = team_epp(off_ppa_home, def_ppa_away)
+    epp_a = team_epp(off_ppa_away, def_ppa_home)
+    total = epp_h*(plays/2.0) + epp_a*(plays/2.0)
+
+    # modest bump from explosiveness & success (each point ~ 0.5 total points)
+    total += 0.5 * (xpl_pts + sr_pts)
+
+    # soft clamp: real CFB totals live mostly 35–85
+    return int(round(clamp(total, 30, 95)))
+
+
+
+
 
           # ------------------ 1) Games this week ------------------
           games = get(f"{BASE}/games", {"year": YEAR, "week": WEEK, "seasonType":"regular"})
