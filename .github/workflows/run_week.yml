@@ -1,20 +1,11 @@
-name: CFB Model — Week Runner
+name: CFB Model — Week Runner (Full)
 
 on:
   workflow_dispatch:
     inputs:
-      year:
-        description: "Season year"
-        required: true
-        default: "2025"
-      week:
-        description: "Week number"
-        required: true
-        default: "6"
-      scope:
-        description: "top25 or all"
-        required: true
-        default: "top25"
+      year:  { description: "Season year", required: true, default: "2025" }
+      week:  { description: "Week number", required: true, default: "6" }
+      scope: { description: "top25 or all", required: true, default: "top25" }
 
 permissions:
   contents: write
@@ -26,8 +17,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: { python-version: '3.11' }
 
       - name: Install deps
         run: |
@@ -41,95 +31,223 @@ jobs:
           SCOPE: ${{ github.event.inputs.scope }}
         run: |
           python - << 'PY'
-          import os, json, math, time, requests
-          import pandas as pd
+          import os, json, math, requests, pandas as pd
           from tenacity import retry, wait_fixed, stop_after_attempt
 
           BASE = "https://api.collegefootballdata.com"
-          HEAD = {"Authorization": f"Bearer {os.environ['CFBD_API_KEY']}"}
-
-          Y = int(os.getenv("YEAR", "2025"))
-          W = int(os.getenv("WEEK", "6"))
-          SCOPE = os.getenv("SCOPE","top25")
+          KEY  = os.getenv("CFBD_API_KEY")
+          HEAD = {"Authorization": f"Bearer {KEY}"} if KEY else {}
+          YEAR = int(os.getenv("YEAR","2025"))
+          WEEK = int(os.getenv("WEEK","6"))
+          SCOPE= (os.getenv("SCOPE","top25") or "top25").lower()
 
           @retry(wait=wait_fixed(1), stop=stop_after_attempt(5))
           def get(url, params=None):
-              r = requests.get(url, headers=HEAD, params=params or {}, timeout=30)
-              r.raise_for_status()
-              return r.json()
+            r = requests.get(url, headers=HEAD, params=params or {}, timeout=40)
+            r.raise_for_status()
+            return r.json()
 
-          # 1) Pull games for week
-          games = get(f"{BASE}/games", {"year": Y, "week": W, "seasonType": "regular"})
+          def safe_mean(vals, default):
+            vals=[v for v in vals if isinstance(v,(int,float))]
+            return sum(vals)/len(vals) if vals else default
+
+          # ------------------ 1) Games this week ------------------
+          games = get(f"{BASE}/games", {"year": YEAR, "week": WEEK, "seasonType":"regular"})
           gdf = pd.DataFrame(games)
+
+          # Optional Top-25 filter
+          if SCOPE == "top25":
+            ranks = get(f"{BASE}/rankings", {"year": YEAR, "week": WEEK})
+            ap=set()
+            for wk in ranks:
+              for poll in wk.get("polls",[]):
+                if (poll.get("poll") or "").startswith("AP"):
+                  ap |= {t.get("school") for t in poll.get("ranks",[]) if t.get("school")}
+            if ap:
+              gdf = gdf[gdf["homeTeam"].isin(ap) | gdf["awayTeam"].isin(ap)]
+
+          # If nothing left, publish empty and exit cleanly
           if gdf.empty:
-              open("docs/week_preds.json","w").write("[]")
-              raise SystemExit("No games returned for the selected week")
+            os.makedirs("docs", exist_ok=True)
+            open("docs/week_preds.json","w").write("[]")
+            pd.DataFrame().to_csv("week_preds.csv", index=False)
+            raise SystemExit(0)
 
-          # 2) If top25 only, filter to AP Top 25 that week
-          if SCOPE.lower() == "top25":
-              ranks = get(f"{BASE}/rankings", {"year": Y, "week": W})
-              ap = []
-              for wk in ranks:
-                  for poll in wk.get("polls", []):
-                      if poll.get("poll") == "AP Top 25":
-                          ap += [t["school"] for t in poll.get("ranks",[])]
-              top25 = set(ap)
-              gdf = gdf[(gdf['homeTeam'].isin(top25)) | (gdf['awayTeam'].isin(top25))].copy()
+          # ------------------ 2) Team season PPA ------------------
+          ppa = get(f"{BASE}/ppa/teams", {"year": YEAR})
+          off_map, def_map = {}, {}
+          for row in ppa:
+            t=row.get("team")
+            off = ((row.get("offense") or {}).get("overall") or (row.get("offense") or {}).get("ppa") or 0.0) or 0.0
+            deff= ((row.get("defense") or {}).get("overall") or (row.get("defense") or {}).get("ppa") or 0.0) or 0.0
+            if t: off_map[t]=float(off); def_map[t]=float(deff)
 
-          # 3) Pull team PPA (off & def) for season to date
-          ppa = get(f"{BASE}/ppa/teams", {"year": Y})
-          rows=[]
-          for r in ppa:
-              t = r.get("team")
-              off = ((r.get("offense") or {}).get("overall") or 0.0) or 0.0
-              deff = ((r.get("defense") or {}).get("overall") or 0.0) or 0.0
-              rows.append({"team":t,"off_ppa":off,"def_ppa":deff})
-          ppa_df = pd.DataFrame(rows)
+          # ------------------ 3) Drives → starting FP ------------------
+          # (We keep this light: offense OSFP from team's own drives; DSFP allowed from drives vs team's defense)
+          drives_team = {}
+          for t in set(list(gdf["homeTeam"])+list(gdf["awayTeam"])):
+            try:
+              drv_team = get(f"{BASE}/drives", {"year": YEAR, "team": t})
+              osfp = safe_mean([100 - d.get("start_yards_to_goal") for d in drv_team if d.get("start_yards_to_goal") is not None], 25.0)
+            except Exception: osfp = 25.0
+            # Defense side: filter all drives by defense==t (per-API this is allowed)
+            try:
+              drv_all  = get(f"{BASE}/drives", {"year": YEAR})
+              dsfp = safe_mean([100 - d.get("start_yards_to_goal") for d in drv_all if d.get("defense")==t and d.get("start_yards_to_goal") is not None], 25.0)
+            except Exception: dsfp = 25.0
+            drives_team[t] = {"osfp": osfp, "dsfp": dsfp}
 
-          def team_ppa(t):
-              row = ppa_df[ppa_df["team"]==t]
-              if row.empty: return (None,None)
-              return float(row["off_ppa"].iloc[0]), float(row["def_ppa"].iloc[0])
+          def fp_points(h, a, pts_per_yd=0.06):
+            exp_start_home = 0.5*drives_team[h]["osfp"] + 0.5*drives_team[a]["dsfp"]
+            exp_start_away = 0.5*drives_team[a]["osfp"] + 0.5*drives_team[h]["dsfp"]
+            return (exp_start_home - exp_start_away) * pts_per_yd
 
-          # 4) Simple spread model using PPA gap + HFA
-          #    Scale: every 0.10 PPA gap ~ 3 pts (as we used before)
+          # ------------------ 4) Season stats → success/havoc/hidden yards ------------------
+          # We fetch offense/defense/special per team and parse common fields if present.
+          def stat_map(team, cat):
+            try:
+              rows = get(f"{BASE}/stats/season", {"year": YEAR, "team": team, "category": cat})
+              m={}
+              for r in rows:
+                n=(r.get("statName") or r.get("stat_name") or "").lower()
+                v=float(r.get("statValue") or r.get("stat_value") or 0)
+                m[n]=v
+              return m
+            except Exception:
+              return {}
+
+          season_stats = {}
+          for t in set(list(gdf["homeTeam"])+list(gdf["awayTeam"])):
+            season_stats[t] = {
+              "off": stat_map(t,"offense"),
+              "def": stat_map(t,"defense"),
+              "spc": stat_map(t,"special")
+            }
+
+          def hidden_yards(h,a, pts_per_yd=0.055):
+            sh, sa = season_stats[h]["spc"], season_stats[a]["spc"]
+            # rough net punting + (kick return differential)/2
+            net_punt_h = sh.get("netpunting", 0) or (sh.get("puntyards",0)-sh.get("opponentpuntreturnyards",0))/max(1, sh.get("punts",1))
+            net_punt_a = sa.get("netpunting", 0) or (sa.get("puntyards",0)-sa.get("opponentpuntreturnyards",0))/max(1, sa.get("punts",1))
+            ko_h = (sh.get("kickreturnyards",0)-sh.get("opponentkickreturnyards",0))/max(1, sh.get("kickreturns",1))
+            ko_a = (sa.get("kickreturnyards",0)-sa.get("opponentkickreturnyards",0))/max(1, sa.get("kickreturns",1))
+            return ((net_punt_h - net_punt_a) + 0.5*(ko_h - ko_a)) * pts_per_yd
+
+          def success_points(h,a, scale_per_5pct=1.5):
+            # try to find "success rate %" if present
+            def sr(m): 
+              for k,v in m.items():
+                if "success" in k and "%" in k: 
+                  try: return float(v)/100.0
+                  except: pass
+              return None
+            sh_off = sr(season_stats[h]["off"]); sa_def = sr(season_stats[a]["def"])
+            sa_off = sr(season_stats[a]["off"]); sh_def = sr(season_stats[h]["def"])
+            pts=0.0
+            if sh_off is not None and sa_def is not None: pts += ((sh_off-sa_def)/0.05)*scale_per_5pct
+            if sa_off is not None and sh_def is not None: pts -= ((sa_off-sh_def)/0.05)*scale_per_5pct
+            return pts
+
+          def explosiveness_points(h,a, scale_per_0p10=3.0):
+            oh, da = off_map.get(h,0.0), def_map.get(a,0.0)
+            oa, dh = off_map.get(a,0.0), def_map.get(h,0.0)
+            return ((oh-da)-(oa-dh))/0.10*scale_per_0p10
+
+          def pace_total(h,a, baseline=130.0):
+            # use season offense plays/games if available; else baseline
+            def plays_per_game(m):
+              plays=m.get("plays"); g=m.get("games") or m.get("gp") or m.get("gms")
+              try: ppg=float(plays)/float(g) if plays and g else None
+              except: ppg=None
+              return ppg
+            p_h = plays_per_game(season_stats[h]["off"])
+            p_a = plays_per_game(season_stats[a]["off"])
+            return (p_h or 65.0) + (p_a or 65.0)
+
+          def pace_scale(x, total_plays, baseline=130.0, elasticity=0.5):
+            return x*(1.0 + elasticity*((total_plays - baseline)/baseline))
+
+          def havoc_points(h,a, scale=3.0):
+            # crude proxy: (def TFL + sacks)/plays vs opp allowed
+            dh, da_ = season_stats[h]["def"], season_stats[a]["def"]
+            oh, oa_ = season_stats[h]["off"], season_stats[a]["off"]
+            def rate(d, o):
+              tfl = (d.get("tacklesforloss",0) or d.get("tfl",0)) + (d.get("sacks",0) or 0)
+              plays = d.get("plays",0) or 1
+              # offense allowed (sacks + tfl taken)
+              sacks_allowed = o.get("sacksallowed",0) or 0
+              return (tfl + sacks_allowed) / max(1, plays)
+            try:
+              return (rate(season_stats[h]["def"], season_stats[a]["off"]) - 
+                      rate(season_stats[a]["def"], season_stats[h]["off"])) * scale
+            except Exception:
+              return 0.0
+
+          def recency_points(team, opp, n=4, scale=0.5):
+            # last N games point diff per game
+            try:
+              gt = get(f"{BASE}/games/teams", {"year": YEAR, "team": team, "seasonType":"regular"})
+              rows=[(g.get("pointsFor"), g.get("pointsAgainst")) for g in gt if g.get("week",99) < WEEK]
+              rows=rows[-n:]
+              pdpg = safe_mean([(pf - pa) for pf,pa in rows], 0.0)
+            except Exception:
+              pdpg = 0.0
+            try:
+              go = get(f"{BASE}/games/teams", {"year": YEAR, "team": opp, "seasonType":"regular"})
+              rows=[(g.get("pointsFor"), g.get("pointsAgainst")) for g in go if g.get("week",99) < WEEK]
+              rows=rows[-n:]
+              opdpg = safe_mean([(pf - pa) for pf,pa in rows], 0.0)
+            except Exception:
+              opdpg = 0.0
+            return (pdpg - opdpg)*scale
+
+          # baseline spread from PPA gap + HFA
           SCALE_PER_0P10 = 3.0
           HFA = 2.0
+          DEFAULT_TOTAL = 55.0
 
           out=[]
           for _,g in gdf.iterrows():
-              home, away = g["homeTeam"], g["awayTeam"]
-              oh, dh = team_ppa(home)
-              oa, da = team_ppa(away)
-              if None in (oh,dh,oa,da):
-                  # skip if we don't have both teams
-                  continue
-              # expected net efficiency edge (home perspective)
-              edge = ((oh - da) - (oa - dh)) / 0.10 * SCALE_PER_0P10
-              spread = edge + HFA
-              # very simple total (can upgrade later)
-              default_total = 55.0
-              home_pts = round((default_total + spread)/2)
-              away_pts = round(default_total - home_pts)
+            home, away = g["homeTeam"], g["awayTeam"]
 
-              favored = home if spread >= 0 else away
-              out.append({
-                  "home": home,
-                  "away": away,
-                  "favored": favored,
-                  "adj_spread": round(spread,1),
-                  "total_pts": int(default_total),
-                  "home_pts": int(home_pts),
-                  "away_pts": int(away_pts)
-              })
+            base = ((off_map.get(home,0.0)-def_map.get(away,0.0)) -
+                    (off_map.get(away,0.0)-def_map.get(home,0.0))) / 0.10 * SCALE_PER_0P10 + HFA
 
-          # Sort by largest edges first
+            fp   = fp_points(home, away)
+            hy   = hidden_yards(home, away)
+            xpl  = explosiveness_points(home, away)
+            sr   = success_points(home, away)
+            hv   = havoc_points(home, away)
+            plays= pace_total(home, away)
+            # pace-scale the things that grow with plays
+            xpl  = pace_scale(xpl, plays)
+            sr   = pace_scale(sr, plays)
+            hv   = pace_scale(hv, plays)
+            rcy  = recency_points(home, away)
+
+            adj_spread = base + fp + hy + xpl + sr + hv + rcy
+
+            home_pts = round((DEFAULT_TOTAL + adj_spread)/2)
+            away_pts = round(DEFAULT_TOTAL - home_pts)
+            favored = home if adj_spread >= 0 else away
+
+            out.append({
+              "home":home,"away":away,"favored":favored,
+              "base_spread": round(base,1),
+              "adj_spread":  round(adj_spread,1),
+              "home_pts": int(home_pts), "away_pts": int(away_pts),
+              "total_pts": int(DEFAULT_TOTAL),
+              "plays_est": int(round(plays)),
+              "fp": round(fp,2), "hidden": round(hy,2),
+              "xpl": round(xpl,2), "sr": round(sr,2),
+              "havoc": round(hv,2), "recency": round(rcy,2)
+            })
+
           out = sorted(out, key=lambda r: abs(r["adj_spread"]), reverse=True)
-          # Publish artifacts
           pd.DataFrame(out).to_csv("week_preds.csv", index=False)
+          os.makedirs("docs", exist_ok=True)
           with open("docs/week_preds.json","w",encoding="utf-8") as f:
-              json.dump(out, f, ensure_ascii=False)
-
+            json.dump(out, f, ensure_ascii=False)
           PY
 
       - name: Commit JSON to docs (for Pages)
