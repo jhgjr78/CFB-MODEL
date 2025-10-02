@@ -1,8 +1,20 @@
-
-name: CFB Model — Baseline (mobile)
+name: CFB Model — Week Runner
 
 on:
   workflow_dispatch:
+    inputs:
+      year:
+        description: "Season year"
+        required: true
+        default: "2025"
+      week:
+        description: "Week number"
+        required: true
+        default: "6"
+      scope:
+        description: "top25 or all"
+        required: true
+        default: "top25"
 
 permissions:
   contents: write
@@ -19,19 +31,105 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install pandas
+          pip install requests pandas tenacity
 
-      - name: Generate sample predictions (stub)
+      - name: Build Week predictions & publish JSON
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          YEAR: ${{ github.event.inputs.year }}
+          WEEK: ${{ github.event.inputs.week }}
+          SCOPE: ${{ github.event.inputs.scope }}
         run: |
           python - << 'PY'
+          import os, json, math, time, requests
           import pandas as pd
-          df = pd.DataFrame([
-            {"home":"Oklahoma","away":"Auburn","favored":"Oklahoma","adj_spread":8.5,"total_pts":47,"home_pts":28,"away_pts":19},
-            {"home":"Utah","away":"Texas Tech","favored":"Utah","adj_spread":4.5,"total_pts":57,"home_pts":31,"away_pts":26},
-            {"home":"Notre Dame","away":"Purdue","favored":"Notre Dame","adj_spread":25.0,"total_pts":52,"home_pts":39,"away_pts":13},
-          ])
-          df.to_csv("week_preds.csv", index=False)
-          df.to_json("docs/week_preds.json", orient="records")
+          from tenacity import retry, wait_fixed, stop_after_attempt
+
+          BASE = "https://api.collegefootballdata.com"
+          HEAD = {"Authorization": f"Bearer {os.environ['CFBD_API_KEY']}"}
+
+          Y = int(os.getenv("YEAR", "2025"))
+          W = int(os.getenv("WEEK", "6"))
+          SCOPE = os.getenv("SCOPE","top25")
+
+          @retry(wait=wait_fixed(1), stop=stop_after_attempt(5))
+          def get(url, params=None):
+              r = requests.get(url, headers=HEAD, params=params or {}, timeout=30)
+              r.raise_for_status()
+              return r.json()
+
+          # 1) Pull games for week
+          games = get(f"{BASE}/games", {"year": Y, "week": W, "seasonType": "regular"})
+          gdf = pd.DataFrame(games)
+          if gdf.empty:
+              open("docs/week_preds.json","w").write("[]")
+              raise SystemExit("No games returned for the selected week")
+
+          # 2) If top25 only, filter to AP Top 25 that week
+          if SCOPE.lower() == "top25":
+              ranks = get(f"{BASE}/rankings", {"year": Y, "week": W})
+              ap = []
+              for wk in ranks:
+                  for poll in wk.get("polls", []):
+                      if poll.get("poll") == "AP Top 25":
+                          ap += [t["school"] for t in poll.get("ranks",[])]
+              top25 = set(ap)
+              gdf = gdf[(gdf['homeTeam'].isin(top25)) | (gdf['awayTeam'].isin(top25))].copy()
+
+          # 3) Pull team PPA (off & def) for season to date
+          ppa = get(f"{BASE}/ppa/teams", {"year": Y})
+          rows=[]
+          for r in ppa:
+              t = r.get("team")
+              off = ((r.get("offense") or {}).get("overall") or 0.0) or 0.0
+              deff = ((r.get("defense") or {}).get("overall") or 0.0) or 0.0
+              rows.append({"team":t,"off_ppa":off,"def_ppa":deff})
+          ppa_df = pd.DataFrame(rows)
+
+          def team_ppa(t):
+              row = ppa_df[ppa_df["team"]==t]
+              if row.empty: return (None,None)
+              return float(row["off_ppa"].iloc[0]), float(row["def_ppa"].iloc[0])
+
+          # 4) Simple spread model using PPA gap + HFA
+          #    Scale: every 0.10 PPA gap ~ 3 pts (as we used before)
+          SCALE_PER_0P10 = 3.0
+          HFA = 2.0
+
+          out=[]
+          for _,g in gdf.iterrows():
+              home, away = g["homeTeam"], g["awayTeam"]
+              oh, dh = team_ppa(home)
+              oa, da = team_ppa(away)
+              if None in (oh,dh,oa,da):
+                  # skip if we don't have both teams
+                  continue
+              # expected net efficiency edge (home perspective)
+              edge = ((oh - da) - (oa - dh)) / 0.10 * SCALE_PER_0P10
+              spread = edge + HFA
+              # very simple total (can upgrade later)
+              default_total = 55.0
+              home_pts = round((default_total + spread)/2)
+              away_pts = round(default_total - home_pts)
+
+              favored = home if spread >= 0 else away
+              out.append({
+                  "home": home,
+                  "away": away,
+                  "favored": favored,
+                  "adj_spread": round(spread,1),
+                  "total_pts": int(default_total),
+                  "home_pts": int(home_pts),
+                  "away_pts": int(away_pts)
+              })
+
+          # Sort by largest edges first
+          out = sorted(out, key=lambda r: abs(r["adj_spread"]), reverse=True)
+          # Publish artifacts
+          pd.DataFrame(out).to_csv("week_preds.csv", index=False)
+          with open("docs/week_preds.json","w",encoding="utf-8") as f:
+              json.dump(out, f, ensure_ascii=False)
+
           PY
 
       - name: Commit JSON to docs (for Pages)
