@@ -38,11 +38,10 @@ async function load() {
     const res = await fetch('./week_preds.json?ts='+Date.now());
     if (!res.ok) throw new Error('No JSON yet');
     const rows = await res.json();
-    if (!Array.isArray(rows)) throw new Error('Bad JSON shape');
-    const minEdge = parseFloat(document.getElementById('minEdge').value || '0');
+    const minEdge = parseFloat(document.getElementById('minEdge')?.value || '0');
     const filtered = rows.filter(r => Math.abs(+r.adj_spread||0) >= minEdge);
 
-    const cols = ["home","away","favored","adj_spread","base_spread","home_pts","away_pts","total_pts","plays_est","fp","hidden","xpl","sr","havoc","recency"];
+    const cols = ["home","away","favored","adj_spread","base_spread","home_pts","away_pts","total_pts","vegas_spread","vegas_total","plays_est","fp","hidden","xpl","sr","havoc","recency"];
     table.innerHTML = `
       <div class="small">Theme: Discovery red & blue</div>
       <table><thead><tr>${cols.map(c=>`<th>${c.replace('_',' ')}</th>`).join('')}</tr></thead>
@@ -59,4 +58,3 @@ async function load() {
 function reload(){ load(); }
 load();
 </script>
-</html>
