@@ -117,25 +117,7 @@ jobs:
                 if t in teams:
                   off_map[t]=float(off); def_map[t]=float(deff)
 
-              # 4) team season stats (off/def/special)
-              log("4/7: season stats…")
-              async def team_stats(team):
-                cats = ["offense","defense","special"]
-                async def one(cat):
-                  try:
-                    rows = await jget(client, "/stats/season", {"year": YEAR, "team": team, "category": cat})
-                  except Exception: rows=[]
-                  m={}
-                  for r in rows:
-                    n=(r.get("statName") or r.get("stat_name") or "").lower()
-                    v=r.get("statValue") or r.get("stat_value")
-                    try: v=float(v)
-                    except: pass
-                    m[n]=v
-                  return cat, m
-                pairs = await asyncio.gather(*(one(c) for c in cats))
-                return team, {k:v for k,v in pairs}
-              stats = dict(await asyncio.gather(*(team_stats(t) for t in teams)))
+               season stats (off/def/special)
 
               # 5) drives → starting FP (optional)
               drives_team = {t:{"osfp":25.0,"dsfp":25.0} for t in teams}
