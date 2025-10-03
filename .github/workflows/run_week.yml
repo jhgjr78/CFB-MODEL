@@ -1,4 +1,4 @@
-name: CFB Model — Weekly Runner (with path proof)
+name: CFB Model — Weekly Runner
 
 on:
   workflow_dispatch:
@@ -12,11 +12,11 @@ on:
         required: true
         default: "6"
       scope:
-        description: "top25 | top10 | all"
+        description: "Scope of teams (all, top25, top10)"
         required: true
         default: "top25"
       mode:
-        description: "FULL | FAST (your script can decide how to use this)"
+        description: "Run mode (FULL or FAST)"
         required: true
         default: "FULL"
 
@@ -26,64 +26,35 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install minimal deps
+      - name: Install dependencies
         run: |
-          python -V
-          pip install --upgrade pip
-          # add more libs here as your weekly.py needs them
-          pip install pandas
+          pip install -r requirements.txt || pip install pandas httpx
 
-      # -------- PATH PROOF & DIAGNOSTICS --------
-      - name: Show repo tree (path proof)
-        run: |
-          echo "Branch: $(git rev-parse --abbrev-ref HEAD)"
-          echo "Working dir:"
-          pwd
-          echo "Top-level list:"
-          ls -la
-          echo "runner directory contents:"
-          ls -la runner || echo "(no runner dir)"
-          echo "Files (depth<=3):"
-          find . -maxdepth 3 -type f | sort
-          echo "Attempting to show weekly.py path:"
-          test -f runner/weekly.py && echo "✅ Found runner/weekly.py" || (echo "❌ runner/weekly.py NOT FOUND" && exit 1)
-
-      # (Optional) Show first lines of the script for extra verification
-      - name: Peek weekly.py header
-        run: |
-          head -n 30 runner/weekly.py
-
-      # -------- RUN THE SCRIPT --------
-      - name: Run weekly.py
+      - name: Build Week predictions & publish JSON
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-          YEAR:  ${{ github.event.inputs.year }}
-          WEEK:  ${{ github.event.inputs.week }}
+          YEAR: ${{ github.event.inputs.year }}
+          WEEK: ${{ github.event.inputs.week }}
           SCOPE: ${{ github.event.inputs.scope }}
-          MODE:  ${{ github.event.inputs.mode }}
+          MODE: ${{ github.event.inputs.mode }}
         run: |
-          python runner/weekly.py
+          python .github/runner/weekly.py
 
-      # -------- PUBLISH JSON FOR PAGES --------
       - name: Commit JSON to docs (for Pages)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/week_preds.json || true
-          git commit -m "Publish week_preds.json" || echo "No JSON changes to commit"
-          git push || true
+          git add docs/week_preds.json
+          git commit -m "Publish week_preds.json" || echo "No changes"
+          git push
 
-      # -------- ARTIFACT (CSV) --------
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
         with:
