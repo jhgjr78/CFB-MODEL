@@ -210,54 +210,51 @@ def main() -> int:
             log("No games returned after attempts. Writing empty outputs.")
             return write_outputs([], {"games": 0, "note": "no games"})
 
-  # 2) Rankings filter (Top-N via AP poll with fallback to last available week)
+# 2) Rankings filter (Top-N via AP poll with safe fallback)
 topN = parse_topN(SCOPE)
 
-def ap_topN_teams(year: int, week: int, N: int) -> set[str]:
-    """
-    Try to get AP Top N for the requested week.
-    If empty, gracefully fall back to the latest available week <= requested.
-    """
-    try:
-        ranks_json = jget("/rankings", {"year": year, "week": week}) or []
-    except Exception:
-        ranks_json = []
+if topN is not None:
+    log(f"#2 Using Top-{topN} scope (AP poll with fallback)")
+    use_week = WEEK
+    ranks_json = None
 
-    week_map = {}
-    for wk in ranks_json:
-        wnum = wk.get("week")
-        if not wnum:
-            continue
-        ap_set = set()
-        for poll in wk.get("polls", []):
-            name = (poll.get("poll") or "").lower()
-            if "ap" in name or "associated press" in name:
-                for r in poll.get("ranks", []):
+    # Try current week; if not available, fall back up to 8 weeks back
+    for wk in range(WEEK, max(0, WEEK - 8), -1):
+        try:
+            j = jget("/rankings", {"year": YEAR, "week": wk})
+            if j:
+                ranks_json = j
+                use_week = wk
+                break
+        except Exception as e:
+            log(f"#2 rankings fetch failed for week {wk}: {e}")
+
+    # Extract Top-N AP teams from the rankings payload
+    ap_set = set()
+    try:
+        latest = ranks_json[-1] if ranks_json else {}
+        for poll in latest.get("polls", []) or []:
+            name = str(poll.get("poll", "")).lower()
+            if ("ap" in name) or ("associated press" in name) or ("ap top" in name):
+                for r in poll.get("ranks", []) or []:
                     team = r.get("school") or r.get("team")
                     try:
                         rk = int(r.get("rank"))
                     except Exception:
                         rk = None
-                    if team and rk and rk <= N:
+                    if team and rk and rk <= topN:
                         ap_set.add(team)
-        if ap_set:
-            week_map[wnum] = ap_set
+    except Exception as e:
+        log(f"#2 rankings parse error: {e}")
 
-    if not week_map:
-        return set()
-
-    # use requested week if available, else the closest earlier week
-    weeks = sorted(week_map.keys())
-    usew = week if week in week_map else max([w for w in weeks if w <= week], default=weeks[-1])
-    return week_map.get(usew, set())
-
-if topN is not None:
-    ap = ap_topN_teams(YEAR, WEEK, topN)
-    if ap:
-        gdf = gdf[gdf["homeTeam"].isin(ap) | gdf["awayTeam"].isin(ap)]
+    log(f"#2 AP week used = {use_week}; Top-{topN} teams found = {len(ap_set)}")
+    if ap_set:
+        gdf = gdf[gdf["homeTeam"].isin(ap_set) | gdf["awayTeam"].isin(ap_set)]
     if gdf.empty:
-        log("Scope filter left zero games. Writing empty outputs.")
-        return write_outputs([])
+        log("#2 scope filter left zero games — writing empty outputs.")
+        raise SystemExit(write_outputs([]))
+else:
+    log("#2 Scope is 'all' — keeping every game returned for the week.")
 
         # 3) PPA (season)
         ppa = jget("/ppa/teams", {"year": YEAR})
