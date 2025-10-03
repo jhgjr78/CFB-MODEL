@@ -189,26 +189,18 @@ def main() -> int:
     try:
         log(f"Inputs → YEAR:{YEAR} WEEK:{WEEK} SCOPE:{SCOPE} MODE:{MODE}")
 
-        # 1) Games, with debug dump
-        gdf = fetch_games_resilient(YEAR, WEEK)
+        # 1) Games this week
+log(f"#1 Fetching games for YEAR={YEAR} WEEK={WEEK}")
+try:
+    games = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
+except Exception as e:
+    log(f"#1 games fetch error: {e}")
+    raise SystemExit(write_outputs([]))
 
-        Path("docs").mkdir(parents=True, exist_ok=True)
-        with open("docs/_games_dbg.json", "w", encoding="utf-8") as f:
-            recs = gdf.to_dict("records") if not gdf.empty else []
-            mini = [
-                {
-                    "homeTeam": r.get("homeTeam"),
-                    "awayTeam": r.get("awayTeam"),
-                    "week": r.get("week"),
-                    "seasonType": r.get("seasonType"),
-                    "startDate": r.get("startDate") or r.get("start_date")
-                } for r in recs
-            ]
-            json.dump(mini, f, ensure_ascii=False, indent=2)
-
-        if gdf.empty:
-            log("No games returned after attempts. Writing empty outputs.")
-            return write_outputs([], {"games": 0, "note": "no games"})
+gdf = pd.DataFrame(games or [])
+if gdf.empty:
+    log("#1 No games returned. Writing empty outputs.")
+    raise SystemExit(write_outputs([]))
 
 # 2) Rankings filter (Top-N via AP poll with safe fallback)
 topN = parse_topN(SCOPE)
@@ -218,7 +210,7 @@ if topN is not None:
     use_week = WEEK
     ranks_json = None
 
-    # Try current week; if not available, fall back up to 8 weeks back
+    # Try current week first; if missing, walk back up to 8 weeks
     for wk in range(WEEK, max(0, WEEK - 8), -1):
         try:
             j = jget("/rankings", {"year": YEAR, "week": wk})
@@ -229,14 +221,14 @@ if topN is not None:
         except Exception as e:
             log(f"#2 rankings fetch failed for week {wk}: {e}")
 
-    # Extract Top-N AP teams from the rankings payload
+    # Extract Top-N from AP poll
     ap_set = set()
     try:
         latest = ranks_json[-1] if ranks_json else {}
-        for poll in latest.get("polls", []) or []:
+        for poll in (latest.get("polls") or []):
             name = str(poll.get("poll", "")).lower()
             if ("ap" in name) or ("associated press" in name) or ("ap top" in name):
-                for r in poll.get("ranks", []) or []:
+                for r in (poll.get("ranks") or []):
                     team = r.get("school") or r.get("team")
                     try:
                         rk = int(r.get("rank"))
@@ -255,7 +247,6 @@ if topN is not None:
         raise SystemExit(write_outputs([]))
 else:
     log("#2 Scope is 'all' — keeping every game returned for the week.")
-
         # 3) PPA (season)
         ppa = jget("/ppa/teams", {"year": YEAR})
         off_map, def_map = {}, {}
