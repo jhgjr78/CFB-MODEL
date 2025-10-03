@@ -210,53 +210,54 @@ def main() -> int:
             log("No games returned after attempts. Writing empty outputs.")
             return write_outputs([], {"games": 0, "note": "no games"})
 
-        # 2) Rankings filter (optional)
-        topN = parse_topN(SCOPE)
+  # 2) Rankings filter (Top-N via AP poll with fallback to last available week)
+topN = parse_topN(SCOPE)
 
-        def _poll_is_ap(name: str) -> bool:
-            if not name: return False
-            n = name.lower()
-            return ("ap" in n) or ("associated press" in n) or ("ap top" in n)
+def ap_topN_teams(year: int, week: int, N: int) -> set[str]:
+    """
+    Try to get AP Top N for the requested week.
+    If empty, gracefully fall back to the latest available week <= requested.
+    """
+    try:
+        ranks_json = jget("/rankings", {"year": year, "week": week}) or []
+    except Exception:
+        ranks_json = []
 
-        def _topN_from_rankings(ranks_json, N: int):
-            if not ranks_json: return []
-            latest = ranks_json[-1]
-            out=[]
-            for poll in latest.get("polls", []):
-                if _poll_is_ap(poll.get("poll", "")):
-                    for r in poll.get("ranks", []):
-                        team = r.get("school") or r.get("team")
-                        try: rk = int(r.get("rank"))
-                        except: rk = None
-                        if team and rk and rk <= N:
-                            out.append(team)
-            return out
+    week_map = {}
+    for wk in ranks_json:
+        wnum = wk.get("week")
+        if not wnum:
+            continue
+        ap_set = set()
+        for poll in wk.get("polls", []):
+            name = (poll.get("poll") or "").lower()
+            if "ap" in name or "associated press" in name:
+                for r in poll.get("ranks", []):
+                    team = r.get("school") or r.get("team")
+                    try:
+                        rk = int(r.get("rank"))
+                    except Exception:
+                        rk = None
+                    if team and rk and rk <= N:
+                        ap_set.add(team)
+        if ap_set:
+            week_map[wnum] = ap_set
 
-        if topN is not None:
-            try:
-                ranks = jget("/rankings", {"year": YEAR, "week": WEEK})
-                top_list = _topN_from_rankings(ranks, topN)
-                with open("docs/_rankings_dbg.json", "w", encoding="utf-8") as f:
-                    json.dump({"topN": topN, "teams": top_list}, f, ensure_ascii=False, indent=2)
-                if top_list:
-                    before = len(gdf)
-                    keep = set(top_list)
-                    gdf = gdf[gdf["homeTeam"].isin(keep) | gdf["awayTeam"].isin(keep)]
-                    log(f"Filtered via AP top{topN}: {before} → {len(gdf)}")
-                else:
-                    log("AP poll empty/unavailable; keeping ALL games (no filter).")
-            except Exception as e:
-                log(f"Rankings fetch failed ({e}); keeping ALL games")
-        else:
-            # Still produce a small rankings dbg file for transparency
-            with open("docs/_rankings_dbg.json", "w", encoding="utf-8") as f:
-                json.dump({"topN": None, "teams": []}, f, ensure_ascii=False, indent=2)
+    if not week_map:
+        return set()
 
-        if gdf.empty:
-            log("Scope left zero games. Writing empty outputs.")
-            return write_outputs([], {"games": 0, "note": "filtered to zero"})
+    # use requested week if available, else the closest earlier week
+    weeks = sorted(week_map.keys())
+    usew = week if week in week_map else max([w for w in weeks if w <= week], default=weeks[-1])
+    return week_map.get(usew, set())
 
-        teams = sorted(set(gdf["homeTeam"]).union(gdf["awayTeam"]))
+if topN is not None:
+    ap = ap_topN_teams(YEAR, WEEK, topN)
+    if ap:
+        gdf = gdf[gdf["homeTeam"].isin(ap) | gdf["awayTeam"].isin(ap)]
+    if gdf.empty:
+        log("Scope filter left zero games. Writing empty outputs.")
+        return write_outputs([])
 
         # 3) PPA (season)
         ppa = jget("/ppa/teams", {"year": YEAR})
