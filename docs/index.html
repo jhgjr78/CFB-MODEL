@@ -1,60 +1,111 @@
 <!doctype html>
-<html lang="en">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CFB Model — Mobile</title>
+<title>CFB Model — Mobile Dashboard</title>
 <style>
-:root{--red:#cc0000;--blue:#003366}
-body{font-family:system-ui,Arial;margin:16px;color:var(--blue);background:#fafafa}
-h1{color:#fff;background:var(--red);padding:10px;border-radius:12px;font-size:20px}
-.card{background:#fff;border:1px solid #eee;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.05);padding:12px;margin:12px 0}
-table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #eee;padding:8px;text-align:left;font-size:14px}
-th{background:var(--red);color:#fff;position:sticky;top:0}
-.badge{display:inline-block;background:var(--blue);color:#fff;padding:3px 8px;border-radius:999px;font-size:12px}
-.small{opacity:.8;font-size:12px}
-input,select{font-size:14px;padding:6px;border:1px solid #ddd;border-radius:8px}
-.controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+:root{--red:#cc0000;--blue:#033366;--soft:#eef3f9;--muted:#f5f5f7}
+body{font-family:system-ui,Arial,sans-serif;margin:0;background:#fff;color:#111}
+h1{margin:0;padding:12px 14px;background:var(--red);color:#fff;font-weight:700;font-size:20px}
+.wrap{padding:12px}
+.note{background:#fff3cd;border:1px solid #ffe58f;border-radius:8px;padding:8px 10px;color:#7a5a00;margin-bottom:10px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}
+th{position:sticky;top:0;background:#fff;border-bottom:2px solid var(--blue);color:var(--blue)}
+.badge{display:inline-block;padding:2px 6px;border-radius:6px;font-size:12px}
+.col-model{background:var(--soft)}
+.col-vegas{background:#f0f0f3}
+.col-delta{background:#e8f5ff}
+.empty{padding:14px;border:1px dashed #bbb;border-radius:10px;background:#fafafa}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+input,select,button{font-size:14px;padding:6px 8px;border:1px solid #ccc;border-radius:8px}
+button{background:var(--blue);color:#fff;border:none}
 </style>
 
 <h1>CFB Model — Mobile Dashboard</h1>
-<div class="card controls">
-  <label>Min edge: <input id="minEdge" type="number" value="0" step="0.5"></label>
-  <label>Scope:
+<div class="wrap">
+  <div class="controls">
+    <input id="search" placeholder="Filter teams…" />
     <select id="scope">
-      <option value="all">All</option>
-      <option value="top25" selected>Top 25</option>
+      <option value="">All</option>
+      <option>home</option><option>away</option><option>favored</option>
+      <option>adj_spread</option><option>vegas_spread</option>
+      <option>total_pts</option><option>vegas_total</option>
     </select>
-  </label>
-  <button onclick="reload()" style="padding:6px 10px;border-radius:8px;border:1px solid #ddd;background:#fff">Refresh</button>
+    <button id="reload">Reload</button>
+  </div>
+  <div id="msg" class="note" style="display:none"></div>
+  <div id="table"></div>
 </div>
-<div id="status" class="card">Loading latest results…</div>
-<div id="table" class="card" style="display:none"></div>
 
 <script>
-async function load() {
-  const s = document.getElementById('status');
-  const table = document.getElementById('table');
-  try {
-    const res = await fetch('./week_preds.json?ts='+Date.now());
-    if (!res.ok) throw new Error('No JSON yet');
-    const rows = await res.json();
-    const minEdge = parseFloat(document.getElementById('minEdge')?.value || '0');
-    const filtered = rows.filter(r => Math.abs(+r.adj_spread||0) >= minEdge);
+const modelCols = new Set(["adj_spread","base_spread","home_pts","away_pts","total_pts","plays_est","fp","hidden","xpl","sr","havoc","recency"]);
+const vegasCols = new Set(["vegas_spread","vegas_total"]);
+const deltaCols = new Set(["delta_spread","delta_total"]);
 
-    const cols = ["home","away","favored","adj_spread","base_spread","home_pts","away_pts","total_pts","vegas_spread","vegas_total","plays_est","fp","hidden","xpl","sr","havoc","recency"];
-    table.innerHTML = `
-      <div class="small">Theme: Discovery red & blue</div>
-      <table><thead><tr>${cols.map(c=>`<th>${c.replace('_',' ')}</th>`).join('')}</tr></thead>
-      <tbody>
-        ${filtered.map(r=>`<tr>${cols.map(c=>`<td>${(r[c]??"")}</td>`).join('')}</tr>`).join('')}
-      </tbody></table>
-    `;
-    s.innerHTML = `<span class="badge">Live</span> ${filtered.length} games`;
-    table.style.display = 'block';
-  } catch (e) {
-    s.innerHTML = `No run published yet. Open <a href="../actions">Actions</a> and tap “Run workflow.”`;
+function h(tag, attrs={}, ...kids){
+  const el=document.createElement(tag);
+  for(const [k,v] of Object.entries(attrs)) el.setAttribute(k,v);
+  for(const k of kids) el.append(k?.nodeType? k : document.createTextNode(k));
+  return el;
+}
+
+function renderTable(rows){
+  const host=document.getElementById('table'); host.innerHTML='';
+  if(!rows || !rows.length){
+    host.append(h('div',{class:'empty'},"No predictions published yet. Run the workflow and refresh."));
+    return;
+  }
+  // auto headers based on keys in first row
+  const keys = Object.keys(rows[0]);
+  const tbl=h('table'), thead=h('thead'), tr=h('tr');
+  for(const k of keys){
+    tr.append(h('th',{},k.replace(/_/g,' ')));
+  }
+  thead.append(tr); tbl.append(thead);
+  const tbody=h('tbody');
+  for(const r of rows){
+    const tr=h('tr');
+    for(const k of keys){
+      const td=h('td',{}, String(r[k] ?? ''));
+      if(modelCols.has(k)) td.classList.add('col-model');
+      if(vegasCols.has(k)) td.classList.add('col-vegas');
+      if(deltaCols.has(k)) td.classList.add('col-delta');
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  tbl.append(tbody);
+  host.append(tbl);
+}
+
+async function load(){
+  document.getElementById('msg').style.display='none';
+  try{
+    const bust = Date.now();
+    const res = await fetch(`week_preds.json?t=${bust}`);
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    window._rows = Array.isArray(data)? data: [];
+    renderTable(window._rows);
+  }catch(err){
+    const m=document.getElementById('msg');
+    m.style.display='block';
+    m.textContent=`Could not load week_preds.json (${err.message}). If you just ran a job, wait ~30s and tap Reload.`;
+    renderTable([]);
   }
 }
-function reload(){ load(); }
+
+document.getElementById('reload').onclick=load;
+document.getElementById('search').oninput=function(){
+  const q=this.value.trim().toLowerCase();
+  if(!window._rows) return;
+  const col=document.getElementById('scope').value;
+  const rows = window._rows.filter(r=>{
+    if(!q) return true;
+    if(col && r[col]!=null) return String(r[col]).toLowerCase().includes(q);
+    // search common fields
+    return [r.home,r.away,r.favored].some(x=>String(x||'').toLowerCase().includes(q));
+  });
+  renderTable(rows);
+};
 load();
 </script>
