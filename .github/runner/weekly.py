@@ -7,7 +7,7 @@ CFB weekly projection (single-file)
 Dependencies: pandas, requests
 """
 
-import os, re, json, time, math
+import os, re, json, time
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
@@ -79,9 +79,10 @@ def jget(path: str, params: Dict[str, Any] = None) -> Any:
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
-            if 500 <= getattr(e.response, "status_code", 0) < 600 and attempt < MAX_RETRIES:
+            code = getattr(e.response, "status_code", 0)
+            if 500 <= code < 600 and attempt < MAX_RETRIES:
                 delay = backoff * attempt
-                log(f"[{e.response.status_code}] retrying in {delay:.1f}s… {url}")
+                log(f"[{code}] retrying in {delay:.1f}s… {url}")
                 time.sleep(delay)
                 continue
             raise
@@ -102,7 +103,6 @@ def parse_topN(scope: str) -> Optional[int]:
     m = re.match(r"top(\d+)$", scope)
     if m:
         return int(m.group(1))
-    # default legacy 'top25'
     if scope == "top25":
         return 25
     return None
@@ -135,10 +135,8 @@ def fp_points(drives: Dict[str, Dict[str, float]], h: str, a: str, pts_per_yd: f
     return (exp_h - exp_a) * pts_per_yd
 
 def hidden_yards(spc_h: Dict[str, float], spc_a: Dict[str, float], pts_per_yd: float = 0.055) -> float:
-    # net punting proxy
     net_h = spc_h.get("netpunting", 0) or (spc_h.get("puntyards", 0) - spc_h.get("opponentpuntreturnyards", 0)) / max(1, spc_h.get("punts", 1))
     net_a = spc_a.get("netpunting", 0) or (spc_a.get("puntyards", 0) - spc_a.get("opponentpuntreturnyards", 0)) / max(1, spc_a.get("punts", 1))
-    # kick return differential (rarer → half weight)
     ko_h = (spc_h.get("kickreturnyards", 0) - spc_h.get("opponentkickreturnyards", 0)) / max(1, spc_h.get("kickreturns", 1))
     ko_a = (spc_a.get("kickreturnyards", 0) - spc_a.get("opponentkickreturnyards", 0)) / max(1, spc_a.get("kickreturns", 1))
     return ((net_h - net_a) + 0.5 * (ko_h - ko_a)) * pts_per_yd
@@ -172,7 +170,6 @@ def explosiveness_points(off_map: Dict[str, float], def_map: Dict[str, float],
 
 def havoc_points(off_h: Dict[str, float], def_h: Dict[str, float],
                  off_a: Dict[str, float], def_a: Dict[str, float], scale: float = 3.0) -> float:
-    # crude: (def TFL + sacks)/plays vs opponent allowed sacks
     def rate(d: Dict[str, float], o: Dict[str, float]) -> float:
         tfl = (d.get("tacklesforloss", 0) or d.get("tfl", 0)) + (d.get("sacks", 0) or 0)
         plays = d.get("plays", 0) or 1
@@ -208,56 +205,54 @@ def main() -> int:
             return write_outputs([])
 
         # 2) OPTIONAL RANKINGS FILTER (robust + fallback)
-topN = parse_topN(SCOPE)   # None for 'all', or an int for 'top10', 'top25', etc.
+        topN = parse_topN(SCOPE)   # None for 'all', or an int for 'top10', 'top25', etc.
 
-def _poll_is_ap(name: str) -> bool:
-    if not name: return False
-    n = name.lower()
-    return ("ap" in n) or ("associated press" in n) or ("ap top" in n)
+        def _poll_is_ap(name: str) -> bool:
+            if not name: return False
+            n = name.lower()
+            return ("ap" in n) or ("associated press" in n) or ("ap top" in n)
 
-def _topN_from_rankings(ranks_json, N: int):
-    # ranks_json is /rankings payload; take the latest entry
-    if not ranks_json: return []
-    latest = ranks_json[-1]
-    out = []
-    for poll in latest.get("polls", []):
-        if _poll_is_ap(poll.get("poll", "")):
-            for r in poll.get("ranks", []):
-                team = r.get("school") or r.get("team")
-                try:
-                    rk = int(r.get("rank"))
-                except Exception:
-                    rk = None
-                if team and rk and rk <= N:
-                    out.append(team)
-    return out
+        def _topN_from_rankings(ranks_json, N: int):
+            if not ranks_json: return []
+            latest = ranks_json[-1]
+            out = []
+            for poll in latest.get("polls", []):
+                if _poll_is_ap(poll.get("poll", "")):
+                    for r in poll.get("ranks", []):
+                        team = r.get("school") or r.get("team")
+                        try:
+                            rk = int(r.get("rank"))
+                        except Exception:
+                            rk = None
+                        if team and rk and rk <= N:
+                            out.append(team)
+            return out
 
-if topN is not None:
-    try:
-        log(f"2/7: rankings… (top{topN})")
-        ranks = jget("/rankings", {"year": YEAR, "week": WEEK})
-        top_set = set(_topN_from_rankings(ranks, topN))
-        if top_set:
-            before = len(gdf)
-            gdf = gdf[gdf["homeTeam"].isin(top_set) | gdf["awayTeam"].isin(top_set)]
-            log(f"…filtered games: {before} -> {len(gdf)} using AP top{topN}")
-        else:
-            log("…no AP poll found for this week; keeping ALL games")
-    except Exception as e:
-        log(f"…rankings fetch failed ({e}); keeping ALL games")
+        if topN is not None:
+            try:
+                log(f"2/7: rankings… (top{topN})")
+                ranks = jget("/rankings", {"year": YEAR, "week": WEEK})
+                top_set = set(_topN_from_rankings(ranks, topN))
+                if top_set:
+                    before = len(gdf)
+                    gdf = gdf[gdf["homeTeam"].isin(top_set) | gdf["awayTeam"].isin(top_set)]
+                    log(f"…filtered games: {before} -> {len(gdf)} using AP top{topN}")
+                else:
+                    log("…no AP poll found for this week; keeping ALL games")
+            except Exception as e:
+                log(f"…rankings fetch failed ({e}); keeping ALL games")
 
-# If filtering resulted in zero, fall back to ALL games so we don't publish []
-if gdf.empty:
-    log("No games after filtering; FALLING BACK to ALL games.")
-    try:
-        games_all = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
-        gdf = pd.DataFrame(games_all)
-    except Exception as e:
-        log(f"…fallback fetch failed ({e})")
+        if gdf.empty:
+            log("No games after filtering; FALLING BACK to ALL games.")
+            try:
+                games_all = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
+                gdf = pd.DataFrame(games_all)
+            except Exception as e:
+                log(f"…fallback fetch failed ({e})")
 
-if gdf.empty:
-    log("Still no games—publishing empty outputs ([])")
-    return write_outputs([])
+        if gdf.empty:
+            log("Still no games—publishing empty outputs ([])")
+            return write_outputs([])
 
         teams = sorted(set(gdf["homeTeam"]).union(gdf["awayTeam"]))
 
@@ -295,7 +290,6 @@ if gdf.empty:
         # 5) Drives for field position (optional FULL)
         drives = {t: {"osfp": 25.0, "dsfp": 25.0} for t in teams}
         if MODE == "FULL":
-            # offense-side
             for t in teams:
                 try:
                     drv = jget("/drives", {"year": YEAR, "week": WEEK, "team": t})
@@ -304,7 +298,6 @@ if gdf.empty:
                     drives[t]["osfp"] = sum(vals) / len(vals) if vals else 25.0
                 except Exception:
                     pass
-            # defense-side
             try:
                 drv_all = jget("/drives", {"year": YEAR, "week": WEEK})
                 per_def = {t: [] for t in teams}
@@ -412,7 +405,6 @@ if gdf.empty:
         return write_outputs(out)
 
     except Exception as e:
-        # Fail-soft: write minimal stub so the workflow never blocks other steps
         log(f"ERROR: {e}")
         return write_outputs([])
 
