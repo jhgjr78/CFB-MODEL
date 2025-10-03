@@ -3,10 +3,10 @@ name: CFB Model — Weekly Runner
 on:
   workflow_dispatch:
     inputs:
-      year:  { description: "Season year",   required: true, default: "2025" }
-      week:  { description: "Week number",   required: true, default: "6" }
-      scope: { description: "all | top25 | top10", required: true, default: "top25" }
-      mode:  { description: "FULL or FAST",  required: true, default: "FULL" }
+      year:  { description: "Season year", required: true, default: "2025" }
+      week:  { description: "Week number", required: true, default: "6" }
+      scope: { description: "Scope: all, top25, top10", required: true, default: "all" }
+      mode:  { description: "Mode: FULL (with drives) or FAST", required: true, default: "FAST" }
 
 permissions:
   contents: write
@@ -21,13 +21,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas httpx
-          fi
+          pip install -r requirements.txt || pip install pandas requests
 
       - name: Build Week predictions & publish JSON
         env:
@@ -37,28 +33,28 @@ jobs:
           SCOPE: ${{ github.event.inputs.scope }}
           MODE:  ${{ github.event.inputs.mode }}
         run: |
-          echo "Running .github/runner/weekly.py"
-          ls -la
-          echo "---- repo tree snapshot ----"
-          git ls-files | sed 's/^/ - /' | head -n 1000
           python .github/runner/weekly.py
 
       - name: Commit JSON to docs (for Pages)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/week_preds.json week_preds.csv || true
-          git commit -m "Publish week_preds.json" || echo "No changes"
+          git add docs/week_preds.json docs/_games_dbg.json docs/_rankings_dbg.json || true
+          git commit -m "Publish week_preds.json + debug" || echo "No changes"
           git push
 
-      - name: Sanity check — list docs & peek JSON
+      - name: Sanity check – list docs & peek JSON + debug
         run: |
           echo "== docs directory =="
           ls -l docs || true
           echo "== JSON size (bytes) =="
           wc -c < docs/week_preds.json || true
-          echo "== First 40 lines =="
+          echo "== First 40 lines of week_preds.json =="
           head -n 40 docs/week_preds.json || true
+          echo "== games debug =="
+          head -n 60 docs/_games_dbg.json || true
+          echo "== rankings debug =="
+          head -n 60 docs/_rankings_dbg.json || true
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
