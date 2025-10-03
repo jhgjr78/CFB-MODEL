@@ -207,22 +207,57 @@ def main() -> int:
             log("No games returned. Writing empty outputs.")
             return write_outputs([])
 
-        # 2) Scope filter (topN via AP poll)
-        topN = parse_topN(SCOPE)
-        if topN is not None:
-            ranks = jget("/rankings", {"year": YEAR, "week": WEEK})
-            ap = set()
-            for wk in ranks:
-                for poll in wk.get("polls", []):
-                    if str(poll.get("poll", "")).startswith("AP"):
-                        for e in poll.get("ranks", []):
-                            if e.get("rank") and int(e["rank"]) <= topN and e.get("school"):
-                                ap.add(e["school"])
-            if ap:
-                gdf = gdf[gdf["homeTeam"].isin(ap) | gdf["awayTeam"].isin(ap)]
-            if gdf.empty:
-                log("Scope filter left zero games. Writing empty outputs.")
-                return write_outputs([])
+        # 2) OPTIONAL RANKINGS FILTER (robust + fallback)
+topN = parse_topN(SCOPE)   # None for 'all', or an int for 'top10', 'top25', etc.
+
+def _poll_is_ap(name: str) -> bool:
+    if not name: return False
+    n = name.lower()
+    return ("ap" in n) or ("associated press" in n) or ("ap top" in n)
+
+def _topN_from_rankings(ranks_json, N: int):
+    # ranks_json is /rankings payload; take the latest entry
+    if not ranks_json: return []
+    latest = ranks_json[-1]
+    out = []
+    for poll in latest.get("polls", []):
+        if _poll_is_ap(poll.get("poll", "")):
+            for r in poll.get("ranks", []):
+                team = r.get("school") or r.get("team")
+                try:
+                    rk = int(r.get("rank"))
+                except Exception:
+                    rk = None
+                if team and rk and rk <= N:
+                    out.append(team)
+    return out
+
+if topN is not None:
+    try:
+        log(f"2/7: rankings… (top{topN})")
+        ranks = jget("/rankings", {"year": YEAR, "week": WEEK})
+        top_set = set(_topN_from_rankings(ranks, topN))
+        if top_set:
+            before = len(gdf)
+            gdf = gdf[gdf["homeTeam"].isin(top_set) | gdf["awayTeam"].isin(top_set)]
+            log(f"…filtered games: {before} -> {len(gdf)} using AP top{topN}")
+        else:
+            log("…no AP poll found for this week; keeping ALL games")
+    except Exception as e:
+        log(f"…rankings fetch failed ({e}); keeping ALL games")
+
+# If filtering resulted in zero, fall back to ALL games so we don't publish []
+if gdf.empty:
+    log("No games after filtering; FALLING BACK to ALL games.")
+    try:
+        games_all = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
+        gdf = pd.DataFrame(games_all)
+    except Exception as e:
+        log(f"…fallback fetch failed ({e})")
+
+if gdf.empty:
+    log("Still no games—publishing empty outputs ([])")
+    return write_outputs([])
 
         teams = sorted(set(gdf["homeTeam"]).union(gdf["awayTeam"]))
 
