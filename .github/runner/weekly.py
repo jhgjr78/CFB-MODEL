@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-CFB weekly projection (single-file)
+CFB weekly projection (single-file, resilient)
 - Safe defaults and clamps to avoid crazy spreads.
+- Robust game fetch with multi-try fallbacks.
 - Works with 'top25', 'all', or 'top10' (any 'top' + number) scopes.
-- Writes: docs/week_preds.json and week_preds.csv
+- Writes: docs/week_preds.json, week_preds.csv, docs/debug.txt (brief counts)
 Dependencies: pandas, requests
 """
 
@@ -22,18 +23,12 @@ NEUTRAL_HFA    = 0.5
 
 # Component caps (absolute contribution in points)
 COMP_LIMITS = {
-    "fp": 6.0,        # field position
-    "hidden": 4.0,    # net punting / KO differential
-    "xpl": 10.0,      # explosiveness
-    "sr": 6.0,        # success rate
-    "havoc": 6.0,     # havoc pressure
-    "recency": 6.0    # recent form
+    "fp": 6.0, "hidden": 4.0, "xpl": 10.0, "sr": 6.0, "havoc": 6.0, "recency": 6.0
 }
-# Weights (components already in "points"—keep at 1.0)
 WEIGHTS = {k: 1.0 for k in COMP_LIMITS.keys()}
 
 # Pace/total modeling
-BASE_EPP = 0.42       # baseline pts/play (~55 over 130 plays)
+BASE_EPP = 0.42
 TOTAL_FLOOR, TOTAL_CEIL = 30, 95
 SPREAD_FLOOR, SPREAD_CEIL = -40.0, 40.0
 
@@ -74,8 +69,7 @@ def jget(path: str, params: Dict[str, Any] = None) -> Any:
                 ra = r.headers.get("Retry-After")
                 delay = float(ra) if ra else backoff * attempt
                 log(f"[429] sleeping {delay:.1f}s before retry… {url}")
-                time.sleep(delay)
-                continue
+                time.sleep(delay); continue
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
@@ -83,28 +77,20 @@ def jget(path: str, params: Dict[str, Any] = None) -> Any:
             if 500 <= code < 600 and attempt < MAX_RETRIES:
                 delay = backoff * attempt
                 log(f"[{code}] retrying in {delay:.1f}s… {url}")
-                time.sleep(delay)
-                continue
+                time.sleep(delay); continue
             raise
         except requests.RequestException as e:
             if attempt < MAX_RETRIES:
                 delay = backoff * attempt
                 log(f"[net error] {e}; retrying in {delay:.1f}s… {url}")
-                time.sleep(delay)
-                continue
+                time.sleep(delay); continue
             raise
 
 def parse_topN(scope: str) -> Optional[int]:
-    """
-    'top25' -> 25, 'top10' -> 10, 'all' -> None.
-    """
-    if scope == "all":
-        return None
+    if scope == "all": return None
     m = re.match(r"top(\d+)$", scope)
-    if m:
-        return int(m.group(1))
-    if scope == "top25":
-        return 25
+    if m: return int(m.group(1))
+    if scope == "top25": return 25
     return None
 
 # -------------------------------
@@ -118,12 +104,9 @@ def pace_total(stats: Dict[str, Dict[str, float]], home: str, away: str) -> floa
     def ppg(m: Dict[str, float]) -> Optional[float]:
         plays = m.get("plays")
         g = m.get("games") or m.get("gp") or m.get("gms")
-        try:
-            return float(plays) / float(g) if plays and g else None
-        except Exception:
-            return None
-    p_h = ppg(stats[home]["off"])
-    p_a = ppg(stats[away]["off"])
+        try: return float(plays) / float(g) if plays and g else None
+        except Exception: return None
+    p_h = ppg(stats[home]["off"]); p_a = ppg(stats[away]["off"])
     return (p_h or 65.0) + (p_a or 65.0)
 
 def pace_scale(x: float, total_plays: float, baseline: float = 130.0, elasticity: float = 0.5) -> float:
@@ -148,10 +131,8 @@ def success_points(off_h: Dict[str, float], def_a: Dict[str, float],
         for k, v in m.items():
             k_low = str(k).lower()
             if "success" in k_low and "%" in k_low:
-                try:
-                    return float(v) / 100.0
-                except Exception:
-                    return None
+                try: return float(v) / 100.0
+                except Exception: return None
         return None
     sh_off, sa_def = sr(off_h), sr(def_a)
     sa_off, sh_def = sr(off_a), sr(def_h)
@@ -175,10 +156,8 @@ def havoc_points(off_h: Dict[str, float], def_h: Dict[str, float],
         plays = d.get("plays", 0) or 1
         sacks_allowed = o.get("sacksallowed", 0) or 0
         return (tfl + sacks_allowed) / max(1, plays)
-    try:
-        return (rate(def_h, off_a) - rate(def_a, off_h)) * scale
-    except Exception:
-        return 0.0
+    try: return (rate(def_h, off_a) - rate(def_a, off_h)) * scale
+    except Exception: return 0.0
 
 def recency_points(team_rows: List[Dict[str, Any]],
                    opp_rows: List[Dict[str, Any]],
@@ -191,21 +170,47 @@ def recency_points(team_rows: List[Dict[str, Any]],
     return (last_pdpg(team_rows) - last_pdpg(opp_rows)) * scale
 
 # -------------------------------
-# Main (single pass, no asyncio)
+# Fetch helpers (robust)
+# -------------------------------
+def fetch_games_resilient(year: int, week: int) -> pd.DataFrame:
+    """Try several queries to avoid empty results."""
+    # 1) exact
+    g = jget("/games", {"year": year, "week": week, "seasonType": "regular"}) or []
+    if g:
+        log(f"/games exact returned {len(g)} rows")
+        return pd.DataFrame(g)
+    log("Exact /games empty → trying year+seasonType, then filter locally")
+    # 2) no week, filter locally
+    g2 = jget("/games", {"year": year, "seasonType": "regular"}) or []
+    if g2:
+        g2 = [x for x in g2 if (x.get("week") == week)]
+        log(f"/games(year,seasonType) returned {len(g2)} rows after local filter")
+        if g2: return pd.DataFrame(g2)
+    # 3) year only
+    log("Year only /games fallback, then local filter")
+    g3 = jget("/games", {"year": year}) or []
+    if g3:
+        g3 = [x for x in g3 if (x.get("week") == week) and (str(x.get("seasonType","")).lower() == "regular")]
+        log(f"/games(year) returned {len(g3)} rows after local filter")
+        if g3: return pd.DataFrame(g3)
+    log("All /games attempts empty")
+    return pd.DataFrame()
+
+# -------------------------------
+# Main
 # -------------------------------
 def main() -> int:
     try:
         log(f"Inputs → YEAR:{YEAR} WEEK:{WEEK} SCOPE:{SCOPE} MODE:{MODE}")
 
-        # 1) Games this week
-        games = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
-        gdf = pd.DataFrame(games)
+        # 1) Games with robust fallbacks
+        gdf = fetch_games_resilient(YEAR, WEEK)
         if gdf.empty:
-            log("No games returned. Writing empty outputs.")
-            return write_outputs([])
+            log("No games returned after all attempts. Writing empty outputs.")
+            return write_outputs([], {"games": 0})
 
-        # 2) OPTIONAL RANKINGS FILTER (robust + fallback)
-        topN = parse_topN(SCOPE)   # None for 'all', or an int for 'top10', 'top25', etc.
+        # 2) Rankings filter (optional)
+        topN = parse_topN(SCOPE)
 
         def _poll_is_ap(name: str) -> bool:
             if not name: return False
@@ -220,43 +225,35 @@ def main() -> int:
                 if _poll_is_ap(poll.get("poll", "")):
                     for r in poll.get("ranks", []):
                         team = r.get("school") or r.get("team")
-                        try:
-                            rk = int(r.get("rank"))
-                        except Exception:
-                            rk = None
+                        try: rk = int(r.get("rank"))
+                        except Exception: rk = None
                         if team and rk and rk <= N:
                             out.append(team)
             return out
 
         if topN is not None:
             try:
-                log(f"2/7: rankings… (top{topN})")
                 ranks = jget("/rankings", {"year": YEAR, "week": WEEK})
                 top_set = set(_topN_from_rankings(ranks, topN))
                 if top_set:
                     before = len(gdf)
                     gdf = gdf[gdf["homeTeam"].isin(top_set) | gdf["awayTeam"].isin(top_set)]
-                    log(f"…filtered games: {before} -> {len(gdf)} using AP top{topN}")
+                    log(f"Filtered via AP top{topN}: {before} → {len(gdf)}")
                 else:
-                    log("…no AP poll found for this week; keeping ALL games")
+                    log("No AP poll found; keeping ALL games")
             except Exception as e:
-                log(f"…rankings fetch failed ({e}); keeping ALL games")
+                log(f"Rankings fetch failed ({e}); keeping ALL games")
 
         if gdf.empty:
-            log("No games after filtering; FALLING BACK to ALL games.")
-            try:
-                games_all = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
-                gdf = pd.DataFrame(games_all)
-            except Exception as e:
-                log(f"…fallback fetch failed ({e})")
+            log("Games empty after filter—keeping ALL (skip filter).")
+            gdf = fetch_games_resilient(YEAR, WEEK)  # try again unfiltered
 
         if gdf.empty:
-            log("Still no games—publishing empty outputs ([])")
-            return write_outputs([])
+            return write_outputs([], {"games": 0})
 
         teams = sorted(set(gdf["homeTeam"]).union(gdf["awayTeam"]))
 
-        # 3) PPA (season)
+        # 3) PPA
         ppa = jget("/ppa/teams", {"year": YEAR})
         off_map, def_map = {}, {}
         for row in ppa:
@@ -266,10 +263,9 @@ def main() -> int:
             deff = ((row.get("defense") or {}).get("overall")
                     or (row.get("defense") or {}).get("ppa") or 0.0) or 0.0
             if t in teams:
-                off_map[t] = float(off)
-                def_map[t] = float(deff)
+                off_map[t] = float(off); def_map[t] = float(deff)
 
-        # 4) Season stats (off/def/special)
+        # 4) Season stats
         def team_cat(team: str, cat: str) -> Dict[str, float]:
             try:
                 rows = jget("/stats/season", {"year": YEAR, "team": team, "category": cat})
@@ -287,7 +283,7 @@ def main() -> int:
                      "def": team_cat(t, "defense"),
                      "spc": team_cat(t, "special")} for t in teams}
 
-        # 5) Drives for field position (optional FULL)
+        # 5) Drives (optional FULL)
         drives = {t: {"osfp": 25.0, "dsfp": 25.0} for t in teams}
         if MODE == "FULL":
             for t in teams:
@@ -310,7 +306,7 @@ def main() -> int:
             except Exception:
                 pass
 
-        # 6) Vegas lines (avg across books)
+        # 6) Vegas
         lines = jget("/lines", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
         v_map: Dict[Tuple[str, str], List[Tuple[Optional[float], Optional[float]]]] = {}
         for ln in lines or []:
@@ -328,7 +324,7 @@ def main() -> int:
                 "vegas_total": round(sum(t) / len(t), 1) if t else None
             }
 
-        # 7) Recency cache (last N games)
+        # 7) Recency cache
         rec_cache: Dict[str, List[Dict[str, Any]]] = {}
         for t in teams:
             try:
@@ -336,20 +332,17 @@ def main() -> int:
             except Exception:
                 rec_cache[t] = []
 
-        # 8) Compute game rows
+        # 8) Compute rows
         out: List[Dict[str, Any]] = []
         for _, g in gdf.iterrows():
             h, a = g["homeTeam"], g["awayTeam"]
             hfa = NEUTRAL_HFA if bool(g.get("neutralSite")) else HFA_DEFAULT
 
-            # base spread from PPA gap + HFA
             base = ((off_map.get(h, 0.0) - def_map.get(a, 0.0)) -
                     (off_map.get(a, 0.0) - def_map.get(h, 0.0))) / 0.10 * SCALE_PER_0P10 + hfa
 
-            # pace / plays
             plays = pace_total(stats, h, a)
 
-            # components
             xpl_raw = pace_scale(explosiveness_points(off_map, def_map, h, a), plays)
             sr_raw  = pace_scale(success_points(stats[h]["off"], stats[a]["def"],
                                                 stats[a]["off"], stats[h]["def"]), plays)
@@ -369,21 +362,16 @@ def main() -> int:
             hv  = cap("havoc", hv_raw)
             rcy = cap("recency", rcy_raw)
 
-            adj = base + fp + hy + xpl + sr + hv + rcy
-            adj = clamp(adj, SPREAD_FLOOR, SPREAD_CEIL)
+            adj = clamp(base + fp + hy + xpl + sr + hv + rcy, SPREAD_FLOOR, SPREAD_CEIL)
 
-            # dynamic total (no fixed 55)
             epp_h = team_epp(off_map.get(h, 0.0), def_map.get(a, 0.0))
             epp_a = team_epp(off_map.get(a, 0.0), def_map.get(h, 0.0))
             total_pts = epp_h * (plays / 2.0) + epp_a * (plays / 2.0)
-            total_pts += 0.5 * (xpl + sr)  # modest bump
+            total_pts += 0.5 * (xpl + sr)
             total_pts = int(round(clamp(total_pts, TOTAL_FLOOR, TOTAL_CEIL)))
 
-            # derive scores
-            home_pts = int(round((total_pts + adj) / 2))
-            away_pts = int(round(total_pts - home_pts))
-            home_pts = max(0, home_pts)
-            away_pts = max(0, away_pts)
+            home_pts = max(0, int(round((total_pts + adj) / 2)))
+            away_pts = max(0, int(round(total_pts - home_pts)))
             favored = h if adj >= 0 else a
 
             v = vegas.get((h, a), {})
@@ -402,17 +390,21 @@ def main() -> int:
             })
 
         out = sorted(out, key=lambda r: abs(r["adj_spread"]), reverse=True)
-        return write_outputs(out)
+        return write_outputs(out, {"games": len(gdf), "rows": len(out)})
 
     except Exception as e:
         log(f"ERROR: {e}")
-        return write_outputs([])
+        return write_outputs([], {"error": str(e)})
 
-def write_outputs(rows: List[Dict[str, Any]]) -> int:
+def write_outputs(rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> int:
     Path("docs").mkdir(parents=True, exist_ok=True)
     with open("docs/week_preds.json", "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False)
     pd.DataFrame(rows).to_csv("week_preds.csv", index=False)
+    # small debug file you can view at Pages
+    meta = {"YEAR": YEAR, "WEEK": WEEK, "SCOPE": SCOPE, "MODE": MODE, **(meta or {})}
+    with open("docs/debug.txt", "w", encoding="utf-8") as f:
+        f.write(json.dumps(meta, indent=2))
     log(f"Wrote {len(rows)} rows → docs/week_preds.json and week_preds.csv")
     return 0
 
