@@ -2,10 +2,10 @@
 """
 CFB weekly projection (single-file)
 - Safe defaults and clamps to avoid crazy spreads.
-- Scope: 'all', or 'topN' (e.g., 'top25', 'top10').
-- Modes: FAST (fewer API hits), FULL (adds drives for field position).
-- Writes: docs/week_preds.json, docs/_games_dbg.json, docs/_rankings_dbg.json, week_preds.csv
-Deps: pandas, requests
+- Scope can be 'all' or 'topNN' (top25, top10, etc.). If AP poll missing,
+  we gracefully SKIP the filter so you still get games.
+- Writes: docs/week_preds.json and week_preds.csv
+Dependencies: pandas, requests
 """
 
 import os, re, json, time
@@ -15,18 +15,19 @@ import pandas as pd
 import requests
 
 # -------------------------------
-# Tunables / limits
+# Tunables
 # -------------------------------
 SCALE_PER_0P10 = 3.0   # spread scaling from PPA gap (per 0.10 PPA)
 HFA_DEFAULT    = 2.0   # home field advantage
 NEUTRAL_HFA    = 0.5
 
 COMP_LIMITS = {
-    "fp": 6.0, "hidden": 4.0, "xpl": 10.0, "sr": 6.0, "havoc": 6.0, "recency": 6.0
+    "fp": 6.0, "hidden": 4.0, "xpl": 10.0,
+    "sr": 6.0, "havoc": 6.0, "recency": 6.0
 }
 WEIGHTS = {k: 1.0 for k in COMP_LIMITS.keys()}
 
-BASE_EPP = 0.42       # baseline pts/play (~55 over 130 plays)
+BASE_EPP = 0.42        # baseline pts/play (~55 over ~130 plays)
 TOTAL_FLOOR, TOTAL_CEIL = 30, 95
 SPREAD_FLOOR, SPREAD_CEIL = -40.0, 40.0
 
@@ -36,24 +37,27 @@ TIMEOUT = 40
 MAX_RETRIES = 5
 
 # -------------------------------
-# Env inputs from workflow
+# Env inputs
 # -------------------------------
 YEAR  = int(os.getenv("YEAR", "2025"))
 WEEK  = int(os.getenv("WEEK", "6"))
-SCOPE = (os.getenv("SCOPE", "all") or "all").lower()   # 'all', 'top25', 'top10'
-MODE  = (os.getenv("MODE", "FAST") or "FAST").upper()  # 'FAST' or 'FULL'
+SCOPE = (os.getenv("SCOPE", "top25") or "top25").lower()
+MODE  = (os.getenv("MODE", "FULL") or "FULL").upper()
 API   = os.getenv("CFBD_API_KEY", "")
 
 HEAD = {"Authorization": f"Bearer {API}"} if API else {}
 
+# -------------------------------
+# Helpers
+# -------------------------------
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def log(msg: str) -> None:
     print(f"::notice::{msg}")
 
-# polite, retrying GET
 def jget(path: str, params: Dict[str, Any] = None) -> Any:
+    """requests.get with polite retry for 429/5xx."""
     url = f"{BASE}{path}"
     params = params or {}
     backoff = 1.5
@@ -63,9 +67,8 @@ def jget(path: str, params: Dict[str, Any] = None) -> Any:
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 delay = float(ra) if ra else backoff * attempt
-                log(f"[429] sleeping {delay:.1f}s… {url}")
-                time.sleep(delay)
-                continue
+                log(f"[429] sleeping {delay:.1f}s then retry… {url}")
+                time.sleep(delay); continue
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
@@ -83,46 +86,24 @@ def jget(path: str, params: Dict[str, Any] = None) -> Any:
             raise
 
 def parse_topN(scope: str) -> Optional[int]:
-    if scope == "all":
-        return None
+    if scope == "all": return None
     m = re.match(r"top(\d+)$", scope)
-    if m:
-        return int(m.group(1))
+    if m: return int(m.group(1))
+    if scope == "top25": return 25
     return None
 
-# --------------------------------
-# Data fetch helpers
-# --------------------------------
-def fetch_games_resilient(year: int, week: int) -> pd.DataFrame:
-    """Try a couple shapes CFBD uses, return DataFrame of games."""
-    params = {"year": year, "week": week, "seasonType": "regular"}
-    try:
-        g = jget("/games", params)
-        df = pd.DataFrame(g or [])
-        if not df.empty:
-            return df
-    except Exception as e:
-        log(f"/games fetch failed once: {e}")
-
-    # second attempt: sometimes not including seasonType helps
-    try:
-        g = jget("/games", {"year": year, "week": week})
-        df = pd.DataFrame(g or [])
-        return df
-    except Exception as e:
-        log(f"/games second attempt failed: {e}")
-        return pd.DataFrame()
-
+# -------------------------------
+# Component calculators
+# -------------------------------
 def team_epp(off_ppa: float, opp_def_ppa: float) -> float:
     epp = BASE_EPP + (off_ppa - opp_def_ppa)
     return clamp(epp, 0.10, 0.80)
 
 def pace_total(stats: Dict[str, Dict[str, float]], home: str, away: str) -> float:
     def ppg(m: Dict[str, float]) -> Optional[float]:
-        plays = m.get("plays")
-        g = m.get("games") or m.get("gp") or m.get("gms")
-        try: return float(plays)/float(g) if plays and g else None
-        except Exception: return None
+        plays = m.get("plays"); g = m.get("games") or m.get("gp") or m.get("gms")
+        try: return float(plays) / float(g) if plays and g else None
+        except: return None
     p_h = ppg(stats[home]["off"]); p_a = ppg(stats[away]["off"])
     return (p_h or 65.0) + (p_a or 65.0)
 
@@ -130,264 +111,287 @@ def pace_scale(x: float, total_plays: float, baseline: float = 130.0, elasticity
     return x * (1.0 + elasticity * ((total_plays - baseline) / baseline))
 
 def fp_points(drives: Dict[str, Dict[str, float]], h: str, a: str, pts_per_yd: float = 0.06) -> float:
-    exp_h = 0.5*drives[h]["osfp"] + 0.5*drives[a]["dsfp"]
-    exp_a = 0.5*drives[a]["osfp"] + 0.5*drives[h]["dsfp"]
+    exp_h = 0.5 * drives[h]["osfp"] + 0.5 * drives[a]["dsfp"]
+    exp_a = 0.5 * drives[a]["osfp"] + 0.5 * drives[h]["dsfp"]
     return (exp_h - exp_a) * pts_per_yd
 
 def hidden_yards(spc_h: Dict[str, float], spc_a: Dict[str, float], pts_per_yd: float = 0.055) -> float:
-    net_h = spc_h.get("netpunting", 0) or (spc_h.get("puntyards",0)-spc_h.get("opponentpuntreturnyards",0))/max(1, spc_h.get("punts",1))
-    net_a = spc_a.get("netpunting", 0) or (spc_a.get("puntyards",0)-spc_a.get("opponentpuntreturnyards",0))/max(1, spc_a.get("punts",1))
-    ko_h = (spc_h.get("kickreturnyards",0)-spc_h.get("opponentkickreturnyards",0))/max(1, spc_h.get("kickreturns",1))
-    ko_a = (spc_a.get("kickreturnyards",0)-spc_a.get("opponentkickreturnyards",0))/max(1, spc_a.get("kickreturns",1))
-    return ((net_h - net_a) + 0.5*(ko_h - ko_a)) * pts_per_yd
+    net_h = spc_h.get("netpunting", 0) or (spc_h.get("puntyards", 0) - spc_h.get("opponentpuntreturnyards", 0)) / max(1, spc_h.get("punts", 1))
+    net_a = spc_a.get("netpunting", 0) or (spc_a.get("puntyards", 0) - spc_a.get("opponentpuntreturnyards", 0)) / max(1, spc_a.get("punts", 1))
+    ko_h = (spc_h.get("kickreturnyards", 0) - spc_h.get("opponentkickreturnyards", 0)) / max(1, spc_h.get("kickreturns", 1))
+    ko_a = (spc_a.get("kickreturnyards", 0) - spc_a.get("opponentkickreturnyards", 0)) / max(1, spc_a.get("kickreturns", 1))
+    return ((net_h - net_a) + 0.5 * (ko_h - ko_a)) * pts_per_yd
 
-def success_points(off_h: Dict[str,float], def_a: Dict[str,float],
-                   off_a: Dict[str,float], def_h: Dict[str,float],
+def success_points(off_h: Dict[str, float], def_a: Dict[str, float],
+                   off_a: Dict[str, float], def_h: Dict[str, float],
                    scale_per_5pct: float = 1.5) -> float:
-    def sr(m: Dict[str,float]) -> Optional[float]:
-        for k,v in m.items():
-            k=str(k).lower()
-            if "success" in k and "%" in k:
-                try: return float(v)/100.0
+    def sr(m: Dict[str, float]) -> Optional[float]:
+        for k, v in m.items():
+            k_low = str(k).lower()
+            if "success" in k_low and "%" in k_low:
+                try: return float(v) / 100.0
                 except: return None
         return None
     sh_off, sa_def = sr(off_h), sr(def_a)
     sa_off, sh_def = sr(off_a), sr(def_h)
     pts = 0.0
-    if sh_off is not None and sa_def is not None: pts += ((sh_off-sa_def)/0.05)*scale_per_5pct
-    if sa_off is not None and sh_def is not None: pts -= ((sa_off-sh_def)/0.05)*scale_per_5pct
+    if sh_off is not None and sa_def is not None:
+        pts += ((sh_off - sa_def) / 0.05) * scale_per_5pct
+    if sa_off is not None and sh_def is not None:
+        pts -= ((sa_off - sh_def) / 0.05) * scale_per_5pct
     return pts
 
-def explosiveness_points(off_map: Dict[str,float], def_map: Dict[str,float],
+def explosiveness_points(off_map: Dict[str, float], def_map: Dict[str, float],
                          h: str, a: str, scale_per_0p10: float = SCALE_PER_0P10) -> float:
-    oh, da = off_map.get(h,0.0), def_map.get(a,0.0)
-    oa, dh = off_map.get(a,0.0), def_map.get(h,0.0)
-    return ((oh-da)-(oa-dh))/0.10 * scale_per_0p10
+    oh, da = off_map.get(h, 0.0), def_map.get(a, 0.0)
+    oa, dh = off_map.get(a, 0.0), def_map.get(h, 0.0)
+    return ((oh - da) - (oa - dh)) / 0.10 * scale_per_0p10
 
-def havoc_points(off_h: Dict[str,float], def_h: Dict[str,float],
-                 off_a: Dict[str,float], def_a: Dict[str,float], scale: float = 3.0) -> float:
-    def rate(d: Dict[str,float], o: Dict[str,float]) -> float:
-        tfl = (d.get("tacklesforloss",0) or d.get("tfl",0)) + (d.get("sacks",0) or 0)
-        plays = d.get("plays",0) or 1
-        sacks_allowed = o.get("sacksallowed",0) or 0
+def havoc_points(off_h: Dict[str, float], def_h: Dict[str, float],
+                 off_a: Dict[str, float], def_a: Dict[str, float], scale: float = 3.0) -> float:
+    def rate(d: Dict[str, float], o: Dict[str, float]) -> float:
+        tfl = (d.get("tacklesforloss", 0) or d.get("tfl", 0)) + (d.get("sacks", 0) or 0)
+        plays = d.get("plays", 0) or 1
+        sacks_allowed = o.get("sacksallowed", 0) or 0
         return (tfl + sacks_allowed) / max(1, plays)
-    try:    return (rate(def_h, off_a) - rate(def_a, off_h)) * scale
+    try: return (rate(def_h, off_a) - rate(def_a, off_h)) * scale
     except: return 0.0
 
-def recency_points(team_rows: List[Dict[str,Any]], opp_rows: List[Dict[str,Any]],
+def recency_points(team_rows: List[Dict[str, Any]],
+                   opp_rows: List[Dict[str, Any]],
                    week: int, n: int = 4, scale: float = 0.5) -> float:
     def last_pdpg(rows):
-        vals = [(g.get("pointsFor"), g.get("pointsAgainst")) for g in rows if (g.get("week") or 99) < week]
+        vals = [(g.get("pointsFor"), g.get("pointsAgainst"))
+                for g in rows if (g.get("week") or 99) < week]
         vals = vals[-n:]
-        return sum((pf-pa) for pf,pa in vals)/len(vals) if vals else 0.0
+        return sum((pf - pa) for pf, pa in vals) / len(vals) if vals else 0.0
     return (last_pdpg(team_rows) - last_pdpg(opp_rows)) * scale
 
-# --------------------------------
-# Main
-# --------------------------------
-def main() -> int:
-    try:
-        log(f"Inputs → YEAR:{YEAR} WEEK:{WEEK} SCOPE:{SCOPE} MODE:{MODE}")
-
-        # 1) Games this week
-log(f"#1 Fetching games for YEAR={YEAR} WEEK={WEEK}")
-try:
-    games = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
-except Exception as e:
-    log(f"#1 games fetch error: {e}")
-    raise SystemExit(write_outputs([]))
-
-gdf = pd.DataFrame(games or [])
-if gdf.empty:
-    log("#1 No games returned. Writing empty outputs.")
-    raise SystemExit(write_outputs([]))
-
-# 2) Rankings filter (Top-N via AP poll with safe fallback)
-topN = parse_topN(SCOPE)
-
-if topN is not None:
-    log(f"#2 Using Top-{topN} scope (AP poll with fallback)")
-    use_week = WEEK
-    ranks_json = None
-
-    # Try current week first; if missing, walk back up to 8 weeks
-    for wk in range(WEEK, max(0, WEEK - 8), -1):
-        try:
-            j = jget("/rankings", {"year": YEAR, "week": wk})
-            if j:
-                ranks_json = j
-                use_week = wk
-                break
-        except Exception as e:
-            log(f"#2 rankings fetch failed for week {wk}: {e}")
-
-    # Extract Top-N from AP poll
-    ap_set = set()
-    try:
-        latest = ranks_json[-1] if ranks_json else {}
-        for poll in (latest.get("polls") or []):
-            name = str(poll.get("poll", "")).lower()
-            if ("ap" in name) or ("associated press" in name) or ("ap top" in name):
-                for r in (poll.get("ranks") or []):
-                    team = r.get("school") or r.get("team")
-                    try:
-                        rk = int(r.get("rank"))
-                    except Exception:
-                        rk = None
-                    if team and rk and rk <= topN:
-                        ap_set.add(team)
-    except Exception as e:
-        log(f"#2 rankings parse error: {e}")
-
-    log(f"#2 AP week used = {use_week}; Top-{topN} teams found = {len(ap_set)}")
-    if ap_set:
-        gdf = gdf[gdf["homeTeam"].isin(ap_set) | gdf["awayTeam"].isin(ap_set)]
-    if gdf.empty:
-        log("#2 scope filter left zero games — writing empty outputs.")
-        raise SystemExit(write_outputs([]))
-else:
-    log("#2 Scope is 'all' — keeping every game returned for the week.")
-        # 3) PPA (season)
-        ppa = jget("/ppa/teams", {"year": YEAR})
-        off_map, def_map = {}, {}
-        for row in ppa or []:
-            t = row.get("team")
-            off = ((row.get("offense") or {}).get("overall") or (row.get("offense") or {}).get("ppa") or 0.0) or 0.0
-            deff= ((row.get("defense") or {}).get("overall") or (row.get("defense") or {}).get("ppa") or 0.0) or 0.0
-            if t in teams:
-                off_map[t]=float(off); def_map[t]=float(deff)
-
-        # 4) Season stats (off/def/special)
-        def team_cat(team: str, cat: str) -> Dict[str, float]:
-            try:
-                rows = jget("/stats/season", {"year": YEAR, "team": team, "category": cat})
-                m={}
-                for r in rows or []:
-                    n=(r.get("statName") or r.get("stat_name") or "").lower()
-                    v=r.get("statValue") or r.get("stat_value")
-                    try: v=float(v)
-                    except: pass
-                    m[n]=v
-                return m
-            except Exception:
-                return {}
-        stats = {t: {"off": team_cat(t,"offense"),
-                     "def": team_cat(t,"defense"),
-                     "spc": team_cat(t,"special")} for t in teams}
-
-        # 5) Drives → field position (optional FULL)
-        drives = {t: {"osfp":25.0, "dsfp":25.0} for t in teams}
-        if MODE == "FULL":
-            for t in teams:
-                try:
-                    drv = jget("/drives", {"year": YEAR, "week": WEEK, "team": t})
-                    vals=[100 - d.get("start_yards_to_goal") for d in drv if d.get("start_yards_to_goal") is not None]
-                    drives[t]["osfp"]=sum(vals)/len(vals) if vals else 25.0
-                except Exception: pass
-            try:
-                drv_all = jget("/drives", {"year": YEAR, "week": WEEK})
-                per_def={t:[] for t in teams}
-                for d in drv_all or []:
-                    tt=d.get("defense")
-                    if tt in per_def and d.get("start_yards_to_goal") is not None:
-                        per_def[tt].append(100 - d["start_yards_to_goal"])
-                for t,vals in per_def.items():
-                    drives[t]["dsfp"]=sum(vals)/len(vals) if vals else 25.0
-            except Exception: pass
-
-        # 6) Vegas lines (avg)
-        lines = jget("/lines", {"year": YEAR, "week": WEEK, "seasonType":"regular"})
-        v_map={}
-        for ln in lines or []:
-            home,away = ln.get("homeTeam"), ln.get("awayTeam")
-            for b in (ln.get("lines") or []):
-                sp=b.get("spread"); to=b.get("overUnder")
-                if home and away and (sp is not None or to is not None):
-                    v_map.setdefault((home,away), []).append((sp,to))
-        vegas={}
-        for k,vals in v_map.items():
-            s=[v for v,_ in vals if isinstance(v,(int,float))]
-            t=[u for _,u in vals if isinstance(u,(int,float))]
-            vegas[k]={"vegas_spread": round(sum(s)/len(s),1) if s else None,
-                      "vegas_total":  round(sum(t)/len(t),1) if t else None}
-
-        # 7) Recency cache
-        rec_cache={}
-        for t in teams:
-            try:
-                rec_cache[t]= jget("/games/teams", {"year": YEAR, "team": t, "seasonType":"regular"}) or []
-            except Exception:
-                rec_cache[t]=[]
-
-        # 8) Compute rows
-        out=[]
-        for _, g in gdf.iterrows():
-            h, a = g["homeTeam"], g["awayTeam"]
-            hfa = NEUTRAL_HFA if bool(g.get("neutralSite")) else HFA_DEFAULT
-
-            base = ((off_map.get(h,0.0)-def_map.get(a,0.0)) -
-                    (off_map.get(a,0.0)-def_map.get(h,0.0))) / 0.10 * SCALE_PER_0P10 + hfa
-
-            plays = pace_total(stats, h, a)
-
-            xpl_raw = pace_scale(explosiveness_points(off_map, def_map, h, a), plays)
-            sr_raw  = pace_scale(success_points(stats[h]["off"], stats[a]["def"],
-                                                stats[a]["off"], stats[h]["def"]), plays)
-            hv_raw  = pace_scale(havoc_points(stats[h]["off"], stats[h]["def"],
-                                              stats[a]["off"], stats[a]["def"]), plays)
-            fp_raw  = fp_points(drives, h, a) if MODE=="FULL" else 0.0
-            hy_raw  = hidden_yards(stats[h]["spc"], stats[a]["spc"]) if MODE=="FULL" else 0.0
-            rcy_raw = recency_points(rec_cache.get(h,[]), rec_cache.get(a,[]), WEEK)
-
-            def cap(name,val): return clamp(val*WEIGHTS[name], -COMP_LIMITS[name], COMP_LIMITS[name])
-            fp, hy = cap("fp",fp_raw), cap("hidden",hy_raw)
-            xpl, sr = cap("xpl",xpl_raw), cap("sr",sr_raw)
-            hv, rcy = cap("havoc",hv_raw), cap("recency",rcy_raw)
-
-            adj = clamp(base + fp + hy + xpl + sr + hv + rcy, SPREAD_FLOOR, SPREAD_CEIL)
-
-            epp_h = team_epp(off_map.get(h,0.0), def_map.get(a,0.0))
-            epp_a = team_epp(off_map.get(a,0.0), def_map.get(h,0.0))
-            total_pts = epp_h*(plays/2.0) + epp_a*(plays/2.0)
-            total_pts += 0.5*(xpl + sr)
-            total_pts = int(round(clamp(total_pts, TOTAL_FLOOR, TOTAL_CEIL)))
-
-            home_pts = int(round((total_pts + adj)/2))
-            away_pts = int(round(total_pts - home_pts))
-            home_pts = max(0, home_pts); away_pts = max(0, away_pts)
-            favored = h if adj >= 0 else a
-
-            v = vegas.get((h,a), {})
-            out.append({
-                "home":h,"away":a,"favored":favored,
-                "base_spread": round(base,1),
-                "adj_spread":  round(adj,1),
-                "home_pts": home_pts, "away_pts": away_pts,
-                "total_pts": int(total_pts),
-                "vegas_spread": v.get("vegas_spread"),
-                "vegas_total":  v.get("vegas_total"),
-                "plays_est": int(round(plays)),
-                "fp": round(fp,2), "hidden": round(hy,2),
-                "xpl": round(xpl,2), "sr": round(sr,2),
-                "havoc": round(hv,2), "recency": round(rcy,2)
-            })
-
-        out = sorted(out, key=lambda r: abs(r["adj_spread"]), reverse=True)
-        return write_outputs(out, {"games": len(out)})
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        return write_outputs([], {"error": str(e)})
-
-def write_outputs(rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> int:
+# -------------------------------
+# I/O
+# -------------------------------
+def write_outputs(rows: List[Dict[str, Any]]) -> int:
     Path("docs").mkdir(parents=True, exist_ok=True)
-    with open("docs/week_preds.json","w",encoding="utf-8") as f:
+    with open("docs/week_preds.json", "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False)
     pd.DataFrame(rows).to_csv("week_preds.csv", index=False)
-    with open("docs/_meta_dbg.json","w",encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
     log(f"Wrote {len(rows)} rows → docs/week_preds.json and week_preds.csv")
     return 0
+
+# -------------------------------
+# Main
+# -------------------------------
+def main() -> int:
+    log(f"Inputs → YEAR:{YEAR} WEEK:{WEEK} SCOPE:{SCOPE} MODE:{MODE}")
+
+    # ---------- 1) Games this week ----------
+    log(f"#1 Fetching games for YEAR={YEAR} WEEK={WEEK}")
+    try:
+        games = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
+    except Exception as e:
+        log(f"#1 games fetch error: {e}")
+        return write_outputs([])
+
+    gdf = pd.DataFrame(games or [])
+    if gdf.empty:
+        log("#1 No games returned. Writing empty outputs.")
+        return write_outputs([])
+
+    # ---------- 2) Rankings filter (Top-N via AP poll; skip if missing) ----------
+    topN = parse_topN(SCOPE)
+    if topN is not None:
+        log(f"#2 Using Top-{topN} scope; fetching AP poll with fallback…")
+        ranks_json = None
+        used_week = WEEK
+        for wk in range(WEEK, max(0, WEEK - 8), -1):
+            try:
+                j = jget("/rankings", {"year": YEAR, "week": wk})
+                if j:
+                    ranks_json = j; used_week = wk
+                    break
+            except Exception as e:
+                log(f"#2 rankings fetch failed for week {wk}: {e}")
+
+        ap_set = set()
+        if ranks_json:
+            try:
+                latest = ranks_json[-1]
+                for poll in (latest.get("polls") or []):
+                    name = str(poll.get("poll", "")).lower()
+                    if ("ap" in name) or ("associated press" in name) or ("ap top" in name):
+                        for r in (poll.get("ranks") or []):
+                            team = r.get("school") or r.get("team")
+                            rk = r.get("rank")
+                            try: rk = int(rk)
+                            except: rk = None
+                            if team and rk and rk <= topN:
+                                ap_set.add(team)
+            except Exception as e:
+                log(f"#2 rankings parse error: {e}")
+
+        log(f"#2 AP week used={used_week}; teams={len(ap_set)}")
+        if ap_set:
+            gdf = gdf[gdf["homeTeam"].isin(ap_set) | gdf["awayTeam"].isin(ap_set)]
+            if gdf.empty:
+                log("#2 scope filter removed all games; writing empty outputs.")
+                return write_outputs([])
+        else:
+            log("#2 AP poll missing — SKIPPING Top-N filter (keeping all games).")
+
+    # Collect team list after filter
+    teams = sorted(set(gdf["homeTeam"]).union(gdf["awayTeam"]))
+
+    # ---------- 3) PPA (season) ----------
+    try:
+        ppa = jget("/ppa/teams", {"year": YEAR})
+    except Exception as e:
+        log(f"#3 PPA fetch error: {e}")
+        return write_outputs([])
+
+    off_map, def_map = {}, {}
+    for row in ppa or []:
+        t = row.get("team")
+        off = ((row.get("offense") or {}).get("overall")
+               or (row.get("offense") or {}).get("ppa") or 0.0) or 0.0
+        deff = ((row.get("defense") or {}).get("overall")
+                or (row.get("defense") or {}).get("ppa") or 0.0) or 0.0
+        if t in teams:
+            off_map[t] = float(off)
+            def_map[t] = float(deff)
+
+    # ---------- 4) Season stats (off/def/special) ----------
+    def team_cat(team: str, cat: str) -> Dict[str, float]:
+        try:
+            rows = jget("/stats/season", {"year": YEAR, "team": team, "category": cat})
+            m: Dict[str, float] = {}
+            for r in rows or []:
+                n = (r.get("statName") or r.get("stat_name") or "").lower()
+                v = r.get("statValue") or r.get("stat_value")
+                try: v = float(v)
+                except: pass
+                m[n] = v
+            return m
+        except Exception:
+            return {}
+    stats = {t: {"off": team_cat(t, "offense"),
+                 "def": team_cat(t, "defense"),
+                 "spc": team_cat(t, "special")} for t in teams}
+
+    # ---------- 5) Drives for field position (optional FULL) ----------
+    drives = {t: {"osfp": 25.0, "dsfp": 25.0} for t in teams}
+    if MODE == "FULL":
+        # offense-side OSFP per team (this week)
+        for t in teams:
+            try:
+                drv = jget("/drives", {"year": YEAR, "week": WEEK, "team": t})
+                vals = [100 - d.get("start_yards_to_goal")
+                        for d in drv if d.get("start_yards_to_goal") is not None]
+                drives[t]["osfp"] = sum(vals) / len(vals) if vals else 25.0
+            except Exception:
+                pass
+        # defense-side DSFP allowed (this week)
+        try:
+            drv_all = jget("/drives", {"year": YEAR, "week": WEEK})
+            per_def = {t: [] for t in teams}
+            for d in drv_all or []:
+                tt = d.get("defense")
+                if tt in per_def and d.get("start_yards_to_goal") is not None:
+                    per_def[tt].append(100 - d["start_yards_to_goal"])
+            for t, vals in per_def.items():
+                drives[t]["dsfp"] = (sum(vals) / len(vals)) if vals else 25.0
+        except Exception:
+            pass
+
+    # ---------- 6) Vegas lines (avg across books) ----------
+    vegas = {}
+    try:
+        lines = jget("/lines", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
+        v_map: Dict[Tuple[str, str], List[Tuple[Optional[float], Optional[float]]]] = {}
+        for ln in lines or []:
+            home, away = ln.get("homeTeam"), ln.get("awayTeam")
+            for b in (ln.get("lines") or []):
+                sp, to = b.get("spread"), b.get("overUnder")
+                if home and away and (sp is not None or to is not None):
+                    v_map.setdefault((home, away), []).append((sp, to))
+        for k, vals in v_map.items():
+            s = [v for v, _ in vals if isinstance(v, (int, float))]
+            t = [u for _, u in vals if isinstance(u, (int, float))]
+            vegas[k] = {
+                "vegas_spread": round(sum(s) / len(s), 1) if s else None,
+                "vegas_total":  round(sum(t) / len(t), 1) if t else None
+            }
+    except Exception as e:
+        log(f"#6 vegas fetch error (continuing without): {e}")
+
+    # ---------- 7) Recency cache (last N games) ----------
+    rec_cache: Dict[str, List[Dict[str, Any]]] = {}
+    for t in teams:
+        try:
+            rec_cache[t] = jget("/games/teams", {"year": YEAR, "team": t, "seasonType": "regular"}) or []
+        except Exception:
+            rec_cache[t] = []
+
+    # ---------- 8) Compute outputs ----------
+    out: List[Dict[str, Any]] = []
+    for _, g in gdf.iterrows():
+        h, a = g["homeTeam"], g["awayTeam"]
+        hfa = NEUTRAL_HFA if bool(g.get("neutralSite")) else HFA_DEFAULT
+
+        base = ((off_map.get(h, 0.0) - def_map.get(a, 0.0)) -
+                (off_map.get(a, 0.0) - def_map.get(h, 0.0))) / 0.10 * SCALE_PER_0P10 + hfa
+
+        plays = pace_total(stats, h, a)
+
+        xpl_raw = pace_scale(explosiveness_points(off_map, def_map, h, a), plays)
+        sr_raw  = pace_scale(success_points(stats[h]["off"], stats[a]["def"],
+                                            stats[a]["off"], stats[h]["def"]), plays)
+        hv_raw  = pace_scale(havoc_points(stats[h]["off"], stats[h]["def"],
+                                          stats[a]["off"], stats[a]["def"]), plays)
+        fp_raw  = fp_points(drives, h, a) if MODE == "FULL" else 0.0
+        hy_raw  = hidden_yards(stats[h]["spc"], stats[a]["spc"]) if MODE == "FULL" else 0.0
+        rcy_raw = recency_points(rec_cache.get(h, []), rec_cache.get(a, []), WEEK)
+
+        def cap(name: str, val: float) -> float:
+            return clamp(val * WEIGHTS[name], -COMP_LIMITS[name], COMP_LIMITS[name])
+
+        fp  = cap("fp", fp_raw)
+        hy  = cap("hidden", hy_raw)
+        xpl = cap("xpl", xpl_raw)
+        sr  = cap("sr",  sr_raw)
+        hv  = cap("havoc", hv_raw)
+        rcy = cap("recency", rcy_raw)
+
+        adj = base + fp + hy + xpl + sr + hv + rcy
+        adj = clamp(adj, SPREAD_FLOOR, SPREAD_CEIL)
+
+        epp_h = team_epp(off_map.get(h, 0.0), def_map.get(a, 0.0))
+        epp_a = team_epp(off_map.get(a, 0.0), def_map.get(h, 0.0))
+        total_pts = epp_h * (plays / 2.0) + epp_a * (plays / 2.0)
+        total_pts += 0.5 * (xpl + sr)
+        total_pts = int(round(clamp(total_pts, TOTAL_FLOOR, TOTAL_CEIL)))
+
+        home_pts = int(round((total_pts + adj) / 2))
+        away_pts = int(round(total_pts - home_pts))
+        home_pts = max(0, home_pts); away_pts = max(0, away_pts)
+        favored = h if adj >= 0 else a
+
+        v = vegas.get((h, a), {})
+        out.append({
+            "home": h, "away": a, "favored": favored,
+            "base_spread": round(base, 1),
+            "adj_spread":  round(adj, 1),
+            "home_pts": home_pts, "away_pts": away_pts,
+            "total_pts": int(total_pts),
+            "vegas_spread": v.get("vegas_spread"),
+            "vegas_total":  v.get("vegas_total"),
+            "plays_est": int(round(plays)),
+            "fp": round(fp, 2), "hidden": round(hy, 2),
+            "xpl": round(xpl, 2), "sr": round(sr, 2),
+            "havoc": round(hv, 2), "recency": round(rcy, 2)
+        })
+
+    out = sorted(out, key=lambda r: abs(r["adj_spread"]), reverse=True)
+    return write_outputs(out)
 
 if __name__ == "__main__":
     raise SystemExit(main())
