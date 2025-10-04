@@ -1,38 +1,10 @@
-name: Weekly Runner
-
-on:
-  workflow_dispatch:
-    inputs:
-      year:  { description: "Season year", required: true, default: "2025" }
-      week:  { description: "Week number", required: true, default: "6" }
-      scope: { description: "all | top25 | top10", required: true, default: "all" }
-      mode:  { description: "FULL or FAST", required: true, default: "FULL" }
-
-permissions: { contents: write }
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install -r requirements.txt || pip install pandas pyarrow
-      - name: Build week predictions & publish JSON
-        env:
-          YEAR:  ${{ github.event.inputs.year }}
-          WEEK:  ${{ github.event.inputs.week }}
-          SCOPE: ${{ github.event.inputs.scope }}
-          MODE:  ${{ github.event.inputs.mode }}
-        run: python .github/runner/weekly.py
-      - name: Commit JSON to docs (for Pages)
-        run: |
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config user.name  "github-actions[bot]"
-          git add docs/week_preds.json week_preds.csv
-          git commit -m "Publish week predictions" || echo "No changes"
-          git push
-      - name: Sanity peek
-        run: |
-          echo "bytes:" $(wc -c < docs/week_preds.json || echo 0)
-          head -n 40 docs/week_preds.json || true
+- name: Build week predictions & publish JSON
+  env:
+    CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+    YEAR:  ${{ github.event.inputs.year }}
+    WEEK:  ${{ github.event.inputs.week }}
+    SCOPE: ${{ github.event.inputs.scope }}
+    MODE:  ${{ github.event.inputs.mode }}
+  run: |
+    python .github/runner/mini_loader.py
+    python .github/runner/weekly.py
