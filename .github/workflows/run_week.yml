@@ -37,7 +37,12 @@ jobs:
         run: |
           python .github/runner/mini_loader.py
           python .github/runner/weekly.py
-
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # ← give the loader plenty of runway
+    steps:
+      ...
       - name: Commit JSON/data to repo (for Pages)
         run: |
           git config user.name  "github-actions[bot]"
