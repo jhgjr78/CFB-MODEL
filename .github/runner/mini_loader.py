@@ -1,91 +1,117 @@
 #!/usr/bin/env python3
-import os, json, time, random
+# .github/runner/mini_loader.py
+import argparse, json, os, time, random
 from pathlib import Path
 import requests
 
+# ---------- CONFIG ----------
 BASE = "https://api.collegefootballdata.com"
-API  = os.getenv("CFBD_API_KEY", "")
-HEAD = {"Authorization": f"Bearer {API}"} if API else {}
-TIMEOUT = 40
-MAX_RETRIES = 20            # was 6
-MAX_SLEEP   = 15.0          # cap per backoff step
+HFA_DEFAULT = 2.0  # not used here but kept for parity
+HEADERS = lambda: {"Authorization": f"Bearer {os.environ.get('CFBD_API_KEY','')}"}
+RETRY_MAX = 8
+RETRY_BASE = 1.5
+JITTER = (0.25, 0.75)
 
-YEAR = int(os.getenv("YEAR", "2025"))
-WEEK = int(os.getenv("WEEK", "6"))
-SCOPE = (os.getenv("SCOPE", "all") or "all").lower()
+# Files we cache
+def week_dir(year): return Path(f"data/weeks/{year}")
+def season_dir(year): return Path(f"data/season_{year}")
 
-def log(msg): print(f"::notice::{msg}")
+def safe_write(path: Path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Never overwrite with empty
+    if payload is None: 
+        return
+    if isinstance(payload, (list, dict)) and len(payload) == 0:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
 
-def _sleep(s: float):
-    s = min(MAX_SLEEP, max(0.5, s))
-    time.sleep(s)
+def cached(path: Path):
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return None
+    return None
 
-def jget(path, params):
-    """Retry politely; respect Retry-After; add jitter."""
-    url = f"{BASE}{path}"
-    for i in range(1, MAX_RETRIES + 1):
-        r = requests.get(url, headers=HEAD, params=params, timeout=TIMEOUT)
-        if r.status_code == 429 and i < MAX_RETRIES:
-            ra = r.headers.get("Retry-After")
-            base = float(ra) if ra else 1.5 * i
-            delay = base + random.uniform(0, 0.75 * base)
-            log(f"[429] {path} – sleeping {delay:.1f}s then retry…")
-            _sleep(delay); continue
+def backoff_sleep(attempt):
+    base = RETRY_BASE ** attempt
+    jitter = random.uniform(*JITTER)
+    time.sleep(base + jitter)
+
+def fetch_json(endpoint, params):
+    url = f"{BASE}{endpoint}"
+    for attempt in range(RETRY_MAX):
         try:
-            r.raise_for_status()
-            return r.json()
-        except requests.HTTPError:
-            if 500 <= r.status_code < 600 and i < MAX_RETRIES:
-                base = 1.5 * i
-                delay = base + random.uniform(0, 0.5 * base)
-                log(f"[{r.status_code}] {path} – sleeping {delay:.1f}s then retry…")
-                _sleep(delay); continue
-            raise
+            r = requests.get(url, headers=HEADERS(), params=params, timeout=30)
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception:
+                    # Sometimes a blank body with 200 (rare) — treat as retry
+                    pass
+            elif r.status_code in (429, 500, 502, 503, 504):
+                # Polite backoff
+                backoff_sleep(attempt)
+            else:
+                # Other errors: short backoff, keep trying
+                backoff_sleep(attempt)
+        except requests.RequestException:
+            backoff_sleep(attempt)
+    return None
 
-def _safe_write(path: Path, payload, describe: str):
-    """Only overwrite if payload is non-empty."""
-    n = 0
-    if isinstance(payload, list):
-        n = len(payload)
-    elif isinstance(payload, dict):
-        # treat “non-empty” conservatively
-        n = len(payload) or (1 if ("polls" in payload or "rankings" in payload) else 0)
-    if n > 0:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False))
-        log(f"Saved {describe} → {path} ({n} rows/snapshots)")
-    else:
-        log(f"Kept old {describe} – fetched empty, not overwriting: {path}")
+def ensure_week(year, week, mode):
+    wdir = week_dir(year)
+    sdir = season_dir(year)
+
+    # paths
+    games_p = wdir / f"week_{week}.games.json"
+    ranks_p = wdir / f"week_{week}.rankings.json"
+    ppa_p   = sdir / "ppa_teams.json"
+    drives_p = wdir / f"week_{week}.drives.json"
+    lines_p  = wdir / f"week_{week}.lines.json"
+
+    # GAMES
+    if not games_p.exists():
+        games = fetch_json("/games", {"year": year, "week": week, "seasonType": "regular"})
+        safe_write(games_p, games)
+    # RANKINGS
+    if not ranks_p.exists():
+        rankings = fetch_json("/rankings", {"year": year, "week": week})
+        safe_write(ranks_p, rankings)
+    # PPA TEAMS (season-level)
+    if not ppa_p.exists():
+        ppa = fetch_json("/ppa/teams", {"year": year})
+        safe_write(ppa_p, ppa)
+
+    if mode.upper() == "FULL":
+        # DRIVES
+        if not drives_p.exists():
+            drives = fetch_json("/drives", {"year": year, "week": week})
+            safe_write(drives_p, drives)
+        # LINES
+        if not lines_p.exists():
+            lines = fetch_json("/lines", {"year": year, "week": week})
+            safe_write(lines_p, lines)
+
+    # final sanity: do not overwrite existing files with empties; done by safe_write
+    # Print quick summary for logs
+    for p in [games_p, ranks_p, ppa_p, drives_p if mode.upper()=="FULL" else None, lines_p if mode.upper()=="FULL" else None]:
+        if p and p.exists(): 
+            print(f"[cache ok] {p}")
+        elif p:
+            print(f"[cache miss] {p}")
 
 def main():
-    # Stagger start a bit so we don't collide with everyone else
-    jitter = random.uniform(2.0, 12.0)
-    log(f"Mini Loader start → YEAR={YEAR} WEEK={WEEK} SCOPE={SCOPE} (start jitter {jitter:.1f}s)")
-    _sleep(jitter)
-
-    p_games    = Path(f"data/weeks/{YEAR}/week_{WEEK}.games.json")
-    p_rankings = Path(f"data/weeks/{YEAR}/week_{WEEK}.rankings.json")
-    p_ppa      = Path(f"data/season_{YEAR}/ppa_teams.json")
-
-    try:
-        games = jget("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"}) or []
-    except Exception:
-        games = []
-    _safe_write(p_games, games, "games")
-
-    try:
-        rankings = jget("/rankings", {"year": YEAR, "week": WEEK}) or []
-    except Exception:
-        rankings = []
-    _safe_write(p_rankings, rankings, "rankings")
-
-    try:
-        ppa = jget("/ppa/teams", {"year": YEAR}) or []
-    except Exception:
-        ppa = []
-    _safe_write(p_ppa, ppa, "PPA")
-
-    log("Mini Loader done.")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--year", required=True, type=int)
+    ap.add_argument("--week", required=True, type=int)
+    ap.add_argument("--mode", default="FAST", choices=["FAST", "FULL"])
+    args = ap.parse_args()
+    if not os.environ.get("CFBD_API_KEY"):
+        print("WARNING: CFBD_API_KEY not set; live calls will fail if cache is empty.")
+    ensure_week(args.year, args.week, args.mode)
 
 if __name__ == "__main__":
     main()
