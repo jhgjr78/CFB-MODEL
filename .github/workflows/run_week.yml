@@ -3,28 +3,18 @@ name: Weekly Runner
 on:
   workflow_dispatch:
     inputs:
-      year:
-        description: "Season year (e.g. 2025)"
-        required: true
-        default: "2025"
-      week:
-        description: "Week number"
-        required: true
-        default: "6"
-      scope:
-        description: "Scope (all | top25 | top10)"
-        required: true
-        default: "all"
-      mode:
-        description: "Mode (FAST | FULL)"
-        required: true
-        default: "FULL"
+      year:  { description: "Season year (e.g. 2025)", required: true, default: "2025" }
+      week:  { description: "Week number",            required: true, default: "6" }
+      scope: { description: "Scope (all | top25 | top10)", required: true, default: "all" }
+      mode:  { description: "Mode (FAST | FULL)",     required: true, default: "FULL" }
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      # --- Setup and dependencies ---
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -37,7 +27,6 @@ jobs:
         run: |
           pip install -r requirements.txt || pip install pandas pyarrow requests
 
-      # --- Build & Predict (cache + runner) ---
       - name: Build week predictions & publish JSON
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
@@ -49,21 +38,16 @@ jobs:
           python .github/runner/mini_loader.py
           python .github/runner/weekly.py
 
-      # --- Commit updated data/docs to repo for Pages ---
-      - name: Commit JSON to docs (for Pages)
+      - name: Commit JSON/data to repo (for Pages)
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/*.json week_preds.csv data/
           git commit -m "Auto update week ${{ github.event.inputs.week }} (${{ github.event.inputs.year }})" || echo "No changes to commit"
           git push
 
-      # --- Debug sanity peek (optional, safe) ---
       - name: Sanity peek
         run: |
-          echo "== docs directory =="
-          ls -lh docs || true
-          echo "== JSON size (bytes) =="
-          wc -c docs/week_preds.json || true
-          echo "== First 40 lines of week_preds.json =="
-          head -n 40 docs/week_preds.json || true
+          echo "== docs ==" && ls -lh docs || true
+          echo "== size week_preds.json ==" && wc -c docs/week_preds.json || true
+          echo "== head ==" && head -n 40 docs/week_preds.json || true
