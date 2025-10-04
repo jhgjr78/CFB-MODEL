@@ -216,35 +216,54 @@ if gdf.empty:
     log("#1 No games returned. Writing empty outputs.")
     return write_outputs([])
 
-    # 2) Scope filter (topN via cached rankings)
-    topN = parse_topN(SCOPE)
-    df = pd.DataFrame(games)
-    if topN is not None:
-        def _poll_is_ap(name: str) -> bool:
-            n=(name or "").lower()
-            return ("ap" in n) or ("associated press" in n) or ("ap top" in n)
-        ap=set()
-        latest = ranks[-1] if ranks else {}
-        for poll in latest.get("polls", []):
-            if _poll_is_ap(poll.get("poll","")):
-                for r in poll.get("ranks", []):
-                    try:
-                        rk=int(r.get("rank"))
-                    except:
-                        rk=None
-                    t=r.get("school") or r.get("team")
-                    if t and rk and rk<=topN: ap.add(t)
-        if ap:
-            df = df[df["homeTeam"].isin(ap) | df["awayTeam"].isin(ap)]
-    if df.empty:
-        Path("docs").mkdir(parents=True, exist_ok=True)
-        write_json(Path("docs/week_preds.json"), [])
-        pd.DataFrame().to_csv("week_preds.csv", index=False)
-        log("Scope resulted in 0 games. Wrote empty outputs.")
-        return 0
+    # === 2) Rankings filter (optional) ==========================================
+topN = parse_topN(SCOPE)
 
-    teams = sorted(set(df["homeTeam"]).union(df["awayTeam"]))
+def _poll_is_ap(name: str) -> bool:
+    if not name:
+        return False
+    n = name.lower()
+    return ("ap" in n) or ("associated press" in n) or ("ap top" in n)
 
+def _topN_from_rankings(ranks_json, N: int):
+    if not ranks_json:
+        return []
+    latest = ranks_json[-1]  # newest snapshot
+    out = []
+    for poll in latest.get("polls", []):
+        if _poll_is_ap(poll.get("poll", "")):
+            for r in poll.get("ranks", []):
+                team = r.get("school") or r.get("team")
+                try:
+                    rk = int(r.get("rank"))
+                except Exception:
+                    rk = None
+                if team and rk and rk <= N:
+                    out.append(team)
+    return out
+
+if topN is not None:
+    log(f"#2 Applying top{topN} filter")
+    ranks = jget_or_none("/rankings", {"year": YEAR, "week": WEEK})
+    if not ranks:
+        cache = Path(f"data/weeks/{YEAR}/week_{WEEK}.rankings.json")
+        if cache.exists():
+            ranks = json.loads(cache.read_text(encoding="utf-8"))
+            log(f"#2 Using cached rankings: {cache}")
+        else:
+            log(f"#2 No rankings from API or cache; leaving all games")
+            ranks = []
+
+    ap = set(_topN_from_rankings(ranks, topN))
+    # Write a small debug stub so we can see what we filtered against
+    with open("docs/_rankings_dbg.json", "w", encoding="utf-8") as f:
+        json.dump({"count": len(ap), "teams": sorted(ap)}, f, ensure_ascii=False)
+
+    if ap:
+        gdf = gdf[gdf["homeTeam"].isin(ap) | gdf["awayTeam"].isin(ap)]
+    if gdf.empty:
+        log("#2 Scope filter left zero games. Writing empty outputs.")
+        return write_outputs([])
     # 3) PPA (cache season file or pull once)
     ppa = read_json(ppa_fp, [])
     if not ppa:
