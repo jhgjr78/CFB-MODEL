@@ -186,33 +186,35 @@ def load_team_stats(year: int, team: str, category: str) -> Dict[str,Any]:
 def main() -> int:
     log(f"Inputs → YEAR:{YEAR} WEEK:{WEEK} SCOPE:{SCOPE} MODE:{MODE}")
 
-    # 1) Load caches or live
-    games = read_json(week_games_fp, [])
-    if not games:
-        log("Cache miss: games. Pulling live once.")
-        try:
-            games = jget("/games", {"year": YEAR, "week": WEEK, "seasonType":"regular"}) or []
-            write_json(week_games_fp, games)
-        except Exception as e:
-            log(f"ERROR pulling games: {e}")
-            games = []
+    # === 1) Fetch games for the week ============================================
+log(f"#1 Fetching games YEAR={YEAR} WEEK={WEEK}")
 
-    if not games:
-        # write empty outputs and bail early
-        Path("docs").mkdir(parents=True, exist_ok=True)
-        write_json(Path("docs/_games_dbg.json"), games)
-        write_json(Path("docs/week_preds.json"), [])
-        pd.DataFrame().to_csv("week_preds.csv", index=False)
-        log("No games found. Wrote empty outputs.")
-        return 0
+def jget_or_none(path, params):
+    try:
+        return jget(path, params)
+    except Exception as e:
+        log(f"[warn] API {path} failed: {e}; will try cache…")
+        return None
 
-    ranks = read_json(week_rankings_fp, [])
-    if not ranks:
-        try:
-            ranks = jget("/rankings", {"year": YEAR, "week": WEEK}) or []
-            write_json(week_rankings_fp, ranks)
-        except Exception:
-            ranks = []
+games = jget_or_none("/games", {"year": YEAR, "week": WEEK, "seasonType": "regular"})
+# Fallback to cache written by mini_loader.py
+if not games:
+    cache = Path(f"data/weeks/{YEAR}/week_{WEEK}.games.json")
+    if cache.exists():
+        games = json.loads(cache.read_text(encoding="utf-8"))
+        log(f"#1 Using cached games: {cache} (count={len(games)})")
+    else:
+        log(f"#1 No games from API and no cache found at {cache}")
+
+# Always drop a debug file so we can inspect in the workflow
+Path("docs").mkdir(parents=True, exist_ok=True)
+with open("docs/_games_dbg.json", "w", encoding="utf-8") as f:
+    json.dump(games or [], f, ensure_ascii=False)
+
+gdf = pd.DataFrame(games or [])
+if gdf.empty:
+    log("#1 No games returned. Writing empty outputs.")
+    return write_outputs([])
 
     # 2) Scope filter (topN via cached rankings)
     topN = parse_topN(SCOPE)
