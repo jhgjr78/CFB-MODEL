@@ -46,6 +46,14 @@ jobs:
           git commit -m "Auto update week ${{ github.event.inputs.week }} (${{ github.event.inputs.year }})" || echo "No changes to commit"
           git push
 
+- name: Peek cache + outputs
+  run: |
+    echo "== cache listing ==" && ls -lh data/weeks/${{ github.event.inputs.year }}/ || true
+    echo "== games cache size ==" && wc -c data/weeks/${{ github.event.inputs.year }}/week_${{ github.event.inputs.week }}.games.json || true
+    echo "== rankings cache head ==" && head -n 20 data/weeks/${{ github.event.inputs.year }}/week_${{ github.event.inputs.week }}.rankings.json || true
+    echo "== docs listing ==" && ls -lh docs || true
+    echo "== week_preds head ==" && head -n 40 docs/week_preds.json || true
+
       - name: Sanity peek
         run: |
           echo "== docs ==" && ls -lh docs || true
