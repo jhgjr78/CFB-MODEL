@@ -1,172 +1,45 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>CFB Model — Mobile Dashboard</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CFB Model — Weekly</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root { --red:#cc0000; --blue:#003366; --ink:#222; --muted:#667; }
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; color:var(--ink); }
-  header { background:var(--red); color:#fff; padding:14px 16px; font-weight:700; font-size:20px; }
-  .bar { display:flex; gap:10px; padding:12px 12px 4px; flex-wrap:wrap; }
-  input, select, button {
-    font-size:16px; padding:10px 12px; border:1px solid #ddd; border-radius:10px;
-  }
-  button { background:var(--blue); color:#fff; border:none; }
-  .wrap { padding:8px 12px 40px; }
-  .card { background:#fff; border:1px solid #eee; border-radius:12px; padding:14px; }
-  .muted { color:var(--muted); }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th, td { padding:10px; border-bottom:1px solid #eee; text-align:left; }
-  thead th { position:sticky; top:0; background:#f8f8f8; z-index:1; }
-  .pos { background:#e8f5e9; }  /* greenish */
-  .neg { background:#ffebee; }  /* reddish */
-  .tag { font-size:12px; padding:2px 8px; border-radius:999px; background:#f1f1f1; }
-  .fav { background:#e6f0ff; }
-  .pill { display:inline-block; padding:4px 10px; border-radius:999px; background:#f3f3f3; }
-  .empty { padding:16px; border:1px dashed #ddd; border-radius:12px; color:#666; }
+  :root { --red:#D32F2F; --blue:#1976D2; --bg:#0b0b10; --card:#141422; --text:#e9eef7; --muted:#9fb0c6; }
+  *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui;background:var(--bg);color:var(--text)}
+  header{padding:16px 12px;border-bottom:1px solid #1f2236; position:sticky;top:0;background:linear-gradient(#0b0b10, #0b0b10cc)}
+  h1{margin:0;font-size:20px}
+  .bar{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+  select,button{background:#10172a;color:var(--text);border:1px solid #223050;padding:8px 10px;border-radius:8px}
+  table{width:100%;border-collapse:separate;border-spacing:0 10px;margin:16px 0}
+  th{font-size:12px;color:var(--muted);text-align:left;padding:8px}
+  td{background:var(--card);padding:10px 8px}
+  .row{border-radius:12px;overflow:hidden}
+  .fav{font-weight:600}
+  .chip{padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid #2a3353;color:#cfe1ff}
+  .g{display:grid;gap:8px;padding:0 12px}
+  .hint{color:var(--muted); font-size:12px}
+  .col-vegas{background:linear-gradient(90deg,#141422, #141422); }
+  .col-ours{background:linear-gradient(90deg,#1a1a2e,#161636);}
+  .deltaUp{color:#8bc34a;font-weight:600}
+  .deltaDn{color:#ff7961;font-weight:600}
 </style>
 </head>
 <body>
-<header>CFB Model — Mobile Dashboard</header>
-
-<div class="bar">
-  <input id="q" placeholder="Filter teams…"/>
-  <select id="scope">
-    <option value="all">All games</option>
-    <option value="top25" selected>Top 25</option>
-    <option value="top10">Top 10</option>
-  </select>
-  <button id="reload">Reload</button>
-</div>
-
-<div class="wrap">
-  <div id="msg" class="empty">Loading…</div>
+<header>
+  <h1>CFB Weekly Predictions</h1>
+  <div class="bar">
+    <span class="chip" id="meta"></span>
+    <button id="refresh">Refresh</button>
+  </div>
+  <div class="hint">Our model vs Vegas (spread/total). Columns shaded: our model (blue), Vegas (neutral).</div>
+</header>
+<main class="g">
   <div id="table"></div>
-</div>
-
-<script>
-async function fetchJSON(url) {
-  // cache-bust every load
-  const r = await fetch(url + '?v=' + Date.now(), { cache:'no-store' });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r.json();
-}
-
-function shade(val) {
-  if (val === null || val === undefined) return '';
-  return val >= 0 ? 'pos' : 'neg';
-}
-
-function ensureNumber(v) {
-  return (typeof v === 'number' && Number.isFinite(v)) ? v : null;
-}
-
-function render(rows) {
-  const query = document.getElementById('q').value.trim().toLowerCase();
-  const scope = document.getElementById('scope').value;
-
-  let filtered = rows;
-
-  // scope filtering if API runner wrote favored/top tags (we’ll just filter by presence in AP)
-  if (scope === 'top25' || scope === 'top10') {
-    // If your JSON includes a ranking field, filter by that.
-    // Fallback: keep all (runner already fetched by scope).
-  }
-
-  // text filter
-  if (query) {
-    filtered = filtered.filter(r => {
-      const s = `${r.home} ${r.away} ${r.favored}`.toLowerCase();
-      return s.includes(query);
-    });
-  }
-
-  if (!filtered.length) {
-    document.getElementById('table').innerHTML = '';
-    document.getElementById('msg').textContent = 'No predictions found. Try reloading or clearing the filter.';
-    return;
-  }
-
-  // compute edges vs vegas (if vegas columns exist)
-  filtered.forEach(r => {
-    const modelSpread = ensureNumber(r.adj_spread);
-    const vegasSpread = ensureNumber(r.vegas_spread);
-    const modelTotal  = ensureNumber(r.total_pts);
-    const vegasTotal  = ensureNumber(r.vegas_total);
-    r.spread_edge = (modelSpread !== null && vegasSpread !== null) ? (modelSpread - vegasSpread) : null;
-    r.total_edge  = (modelTotal !== null && vegasTotal !== null) ? (modelTotal - vegasTotal) : null;
-  });
-
-  // sort by absolute spread edge if available, else abs(adj_spread)
-  filtered.sort((a,b) => {
-    const ae = Math.abs(a.spread_edge ?? a.adj_spread ?? 0);
-    const be = Math.abs(b.spread_edge ?? b.adj_spread ?? 0);
-    return be - ae;
-  });
-
-  const hasVegas = filtered.some(r => r.vegas_spread !== null || r.vegas_total !== null);
-
-  const table = document.createElement('table');
-  table.innerHTML = `
-    <thead>
-      <tr>
-        <th>home</th>
-        <th>away</th>
-        <th>favored</th>
-        <th>adj spread</th>
-        ${hasVegas ? '<th class="muted">vegas spr</th><th>edge</th>' : ''}
-        <th>total</th>
-        ${hasVegas ? '<th class="muted">vegas tot</th><th>edge</th>' : ''}
-      </tr>
-    </thead>
-    <tbody></tbody>
-  `;
-  const tb = table.querySelector('tbody');
-
-  filtered.forEach(r => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${r.home}</td>
-      <td>${r.away}</td>
-      <td><span class="pill fav">${r.favored}</span></td>
-      <td>${r.adj_spread ?? ''}</td>
-      ${hasVegas ? `
-        <td class="muted">${r.vegas_spread ?? ''}</td>
-        <td class="${shade(r.spread_edge)}">${r.spread_edge?.toFixed(1) ?? ''}</td>
-      ` : ''}
-      <td>${r.total_pts ?? ''}</td>
-      ${hasVegas ? `
-        <td class="muted">${r.vegas_total ?? ''}</td>
-        <td class="${shade(r.total_edge)}">${r.total_edge?.toFixed(1) ?? ''}</td>
-      ` : ''}
-    `;
-    tb.appendChild(tr);
-  });
-
-  document.getElementById('msg').textContent = '';
-  document.getElementById('table').replaceChildren(table);
-}
-
-async function load() {
-  document.getElementById('msg').textContent = 'Loading…';
-  document.getElementById('table').innerHTML = '';
-  try {
-    const rows = await fetchJSON('week_preds.json');
-    if (!Array.isArray(rows) || rows.length === 0) {
-      document.getElementById('msg').textContent = 'No predictions published yet. Run the workflow and refresh.';
-      return;
-    }
-    render(rows);
-  } catch (e) {
-    document.getElementById('msg').textContent = 'Could not load week_preds.json (' + e.message + ').';
-  }
-}
-
-document.getElementById('reload').addEventListener('click', load);
-document.getElementById('q').addEventListener('input', load);
-document.getElementById('scope').addEventListener('change', load);
-window.addEventListener('load', load);
-</script>
+</main>
+<script src="app.js"></script>
 </body>
 </html>
