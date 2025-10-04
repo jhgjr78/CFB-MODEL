@@ -1,10 +1,69 @@
-- name: Build week predictions & publish JSON
-  env:
-    CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-    YEAR:  ${{ github.event.inputs.year }}
-    WEEK:  ${{ github.event.inputs.week }}
-    SCOPE: ${{ github.event.inputs.scope }}
-    MODE:  ${{ github.event.inputs.mode }}
-  run: |
-    python .github/runner/mini_loader.py
-    python .github/runner/weekly.py
+name: Weekly Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Season year (e.g. 2025)"
+        required: true
+        default: "2025"
+      week:
+        description: "Week number"
+        required: true
+        default: "6"
+      scope:
+        description: "Scope (all | top25 | top10)"
+        required: true
+        default: "all"
+      mode:
+        description: "Mode (FAST | FULL)"
+        required: true
+        default: "FULL"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      # --- Setup and dependencies ---
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt || pip install pandas pyarrow requests
+
+      # --- Build & Predict (cache + runner) ---
+      - name: Build week predictions & publish JSON
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          YEAR:  ${{ github.event.inputs.year }}
+          WEEK:  ${{ github.event.inputs.week }}
+          SCOPE: ${{ github.event.inputs.scope }}
+          MODE:  ${{ github.event.inputs.mode }}
+        run: |
+          python .github/runner/mini_loader.py
+          python .github/runner/weekly.py
+
+      # --- Commit updated data/docs to repo for Pages ---
+      - name: Commit JSON to docs (for Pages)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add docs/*.json week_preds.csv data/
+          git commit -m "Auto update week ${{ github.event.inputs.week }} (${{ github.event.inputs.year }})" || echo "No changes to commit"
+          git push
+
+      # --- Debug sanity peek (optional, safe) ---
+      - name: Sanity peek
+        run: |
+          echo "== docs directory =="
+          ls -lh docs || true
+          echo "== JSON size (bytes) =="
+          wc -c docs/week_preds.json || true
+          echo "== First 40 lines of week_preds.json =="
+          head -n 40 docs/week_preds.json || true
