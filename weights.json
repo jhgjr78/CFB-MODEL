@@ -1,0 +1,14 @@
+{
+  "SCALE_PER_0P10": 3.0,
+  "HFA_DEFAULT": 2.0,
+  "NEUTRAL_HFA": 0.5,
+
+  "COMP_LIMITS": { "fp": 6.0, "hidden": 4.0, "xpl": 10.0, "sr": 6.0, "havoc": 6.0, "recency": 6.0 },
+  "WEIGHTS":     { "fp": 1.0, "hidden": 1.0, "xpl": 1.0,  "sr": 1.0, "havoc": 1.0,  "recency": 1.0 },
+
+  "BASE_EPP": 0.42,
+  "TOTAL_MIN": 30,
+  "TOTAL_MAX": 95,
+  "SPREAD_MIN": -40.0,
+  "SPREAD_MAX": 40.0
+}
