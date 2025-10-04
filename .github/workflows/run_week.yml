@@ -14,6 +14,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30   # allow long, polite backoff during peak times
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,17 +38,12 @@ jobs:
         run: |
           python .github/runner/mini_loader.py
           python .github/runner/weekly.py
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30   # ← give the loader plenty of runway
-    steps:
-      ...
+
       - name: Commit JSON/data to repo (for Pages)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/*.json week_preds.csv data/
+          git add docs/*.json week_preds.csv data/ || true
           git commit -m "Auto update week ${{ github.event.inputs.week }} (${{ github.event.inputs.year }})" || echo "No changes to commit"
           git push
 
